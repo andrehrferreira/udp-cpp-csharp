@@ -1,0 +1,11 @@
+/mnt/g/ToS3/2025/FastUDP/bin/Debug/net8.0/FastUDP.deps.json
+/mnt/g/ToS3/2025/FastUDP/bin/Debug/net8.0/FastUDP.dll
+/mnt/g/ToS3/2025/FastUDP/bin/Debug/net8.0/FastUDP.pdb
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.GeneratedMSBuildEditorConfig.editorconfig
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.AssemblyInfoInputs.cache
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.AssemblyInfo.cs
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.csproj.CoreCompileInputs.cache
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.dll
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/refint/FastUDP.dll
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.pdb
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/ref/FastUDP.dll
