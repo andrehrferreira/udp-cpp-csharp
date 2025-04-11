@@ -21,6 +21,10 @@ namespace FastUDP {
         // Collection of sessions in this channel
         protected readonly ConcurrentDictionary<string, FastUdpSession> _sessions = new();
         
+        // Thread pool reference (optional)
+        private FastThreadPool? _threadPool;
+        private Socket? _sharedSocket;
+        
         // Events
         public event EventHandler<FastUdpSession>? SessionAdded;
         public event EventHandler<FastUdpSession>? SessionRemoved;
@@ -124,30 +128,68 @@ namespace FastUDP {
             }
         }
         
+        // Set thread pool for optimization
+        public void SetThreadPool(FastThreadPool threadPool, Socket sharedSocket)
+        {
+            _threadPool = threadPool;
+            _sharedSocket = sharedSocket;
+        }
+        
         // Broadcast a message to all sessions in this channel
         public virtual bool Broadcast(string message, FastUdpSession? sender = null)
         {
-            // Check permissions - only owner or system can broadcast
-            if (sender != null && !IsAllowedToBroadcast(sender))
-                return false;
+            try
+            {
+                // Skip if no sessions or sender is the only session
+                if (_sessions.Count == 0 || (_sessions.Count == 1 && sender != null && _sessions.ContainsKey(sender.Id)))
+                {
+                    return true;
+                }
                 
-            int sentCount = 0;
-            
-            // Send message to all sessions in the channel
-            foreach (var session in _sessions.Values)
-            {
-                if (session.SendMessage(message))
-                    sentCount++;
+                var packet = new FastPacket(EPacketType.Message, message);
+                byte[] packetData = packet.Serialize();
+                
+                // If we have a thread pool, use optimized broadcast method
+                if (_threadPool != null && _sharedSocket != null)
+                {
+                    // Get all endpoints except sender
+                    List<EndPoint> targets = new List<EndPoint>();
+                    foreach (var session in _sessions.Values)
+                    {
+                        if (sender == null || session.Id != sender.Id)
+                        {
+                            targets.Add(session.RemoteEndPoint);
+                        }
+                    }
+                    
+                    // Use thread pool for broadcast
+                    int enqueued = _threadPool.EnqueueBroadcast(_sharedSocket, targets, packetData);
+                    
+                    // Log the broadcast
+                    BroadcastSent?.Invoke(this, $"Broadcast enqueued to {enqueued} clients");
+                    
+                    return enqueued > 0;
+                }
+                
+                // Traditional method as fallback
+                int sent = 0;
+                foreach (var session in _sessions.Values)
+                {
+                    if (sender == null || session.Id != sender.Id)
+                    {
+                        session.Send(packetData);
+                        sent++;
+                    }
+                }
+                
+                BroadcastSent?.Invoke(this, $"Broadcast sent to {sent} clients");
+                return sent > 0;
             }
-            
-            if (sentCount > 0)
+            catch (Exception ex)
             {
-                // Use the protected method to raise the event
-                OnBroadcastSent($"Broadcast sent to {sentCount} sessions");
-                return true;
+                Console.WriteLine($"Error in channel broadcast: {ex.Message}");
+                return false;
             }
-            
-            return false;
         }
         
         // Broadcast binary data to all sessions in this channel
@@ -165,8 +207,19 @@ namespace FastUDP {
             // Send to all sessions in the channel
             foreach (var session in _sessions.Values)
             {
-                if (session.SendPacket(packet))
-                    sentCount++;
+                if (sender == null || session.Id != sender.Id)
+                {
+                    try
+                    {
+                        // SendPacket agora retorna void, então simplesmente chamamos o método
+                        session.SendPacket(packet);
+                        sentCount++;
+                    }
+                    catch
+                    {
+                        // Ignore send failures for individual clients
+                    }
+                }
             }
             
             if (sentCount > 0)
@@ -185,22 +238,13 @@ namespace FastUDP {
             // Check permissions - only owner or system can broadcast
             if (sender != null && !IsAllowedToBroadcast(sender))
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[CHANNEL BROADCAST] Session {sender.Id} not allowed to broadcast to {Name} ({Id})");
-                Console.ResetColor();
                 return false;
             }
             
             int sentCount = 0;
             
             try
-            {
-                // Debug info
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Preparing broadcast from {sender?.Id ?? "system"} to channel {Name} ({Id}): '{message.Substring(0, Math.Min(20, message.Length))}'");
-                Console.ResetColor();
-                
-                // Convert channel ID to bytes with a prefix byte for length
+            {                
                 byte[] channelIdBytes = System.Text.Encoding.UTF8.GetBytes(channelId);
                 if (channelIdBytes.Length > 255)
                 {
@@ -218,43 +262,27 @@ namespace FastUDP {
                 
                 // Create a proper packet - with the sender's session ID
                 var packet = new FastPacket(EPacketType.ChannelBroadcast, packetData, sender?.Id ?? "system");
-                
-                // Debug packet
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Created packet: Type={packet.Type}, SessionId='{packet.SessionId}', DataLength={packet.Data.Length}");
-                Console.ResetColor();
-                
+                                
                 // Send to all sessions in the channel except the sender (to avoid echo)
                 foreach (var session in _sessions.Values)
                 {
                     if (sender != null && session.Id == sender.Id)
                     {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Skipping sender {sender.Id}");
-                        Console.ResetColor();
-                        continue; // Skip the sender
+                        continue; 
                     }
-                        
-                    bool success = session.SendPacket(packet);
-                    if (success)
+                    
+                    try
                     {
+                        // SendPacket agora retorna void, então simplesmente chamamos o método
+                        session.SendPacket(packet);
                         sentCount++;
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Sent to session {session.Id}");
-                        Console.ResetColor();
                     }
-                    else
+                    catch
                     {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Failed to send to session {session.Id}");
-                        Console.ResetColor();
+                        // Ignore errors for individual sessions
                     }
                 }
-                
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[CHANNEL BROADCAST] Binary broadcast sent to {sentCount} sessions in channel {Name} ({Id})");
-                Console.ResetColor();
-                
+                                
                 if (sentCount > 0)
                 {
                     // Use the protected method to raise the event
@@ -275,39 +303,13 @@ namespace FastUDP {
         // Check if a session is allowed to broadcast
         public virtual bool IsAllowedToBroadcast(FastUdpSession session)
         {
-            // For public channels, any member can broadcast
             if (Type == EChannelType.Public)
             {
                 bool isMember = HasSession(session.Id);
-                if (isMember)
-                {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} IS a member of public channel {Name} ({Id}) and CAN broadcast");
-                    Console.ResetColor();
-                }
-                else
-                {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} is NOT a member of public channel {Name} ({Id}) and CANNOT broadcast");
-                    Console.ResetColor();
-                }
                 return isMember;
             }
             
-            // For private channels, only the owner can broadcast
             bool result = session.Id == Owner.Id;
-            if (result)
-            {
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} IS the owner of private channel {Name} ({Id}) and CAN broadcast");
-                Console.ResetColor();
-            }
-            else
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} is NOT the owner of private channel {Name} ({Id}). Owner is {Owner.Id}");
-                Console.ResetColor();
-            }
             return result;
         }
     }

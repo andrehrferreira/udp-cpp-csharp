@@ -3,85 +3,120 @@ using System.Net.Sockets;
 using System.Text;
 
 namespace FastUDP {
+    // Class to represent an active UDP session
     public class FastUdpSession
     {
         // Propriedades básicas da sessão
         public string Id { get; private set; }
-        public DateTime LastPacketTime { get; private set; }
         public IPEndPoint RemoteEndPoint { get; private set; }
-        public bool IsConnected { get; private set; }
-        public bool IsAuthenticated { get; private set; }
-        public FastUdpConnection Connection { get; private set; }
         
         // Referência ao socket para envio direto
-        private Socket _socket;
+        private readonly Socket _socket;
         
-        // Timeout após 10s de inatividade
-        public bool IsTimedOut => (DateTime.Now - LastPacketTime).TotalSeconds > 30;
+        // Estado da sessão
+        private bool _isAuthenticated = false;
+        private bool _isDisconnected = false;
+        private DateTime _lastActivity = DateTime.Now;
+        private DateTime _lastPacketTime = DateTime.Now;
+        
+        // Para controle de vazão
+        private readonly FastUdpConnection _connection;
+        
+        // Referência ao thread pool (adicionado do servidor)
+        private FastThreadPool? _threadPool;
+        
+        // Timeout após 5 minutos de inatividade
+        public TimeSpan SessionTimeout { get; set; } = TimeSpan.FromMinutes(5);
         
         // Eventos para notificar sobre mudanças de estado
-        public event EventHandler<string>? Disconnected;
         public event EventHandler<string>? MessageSent;
+        public event EventHandler<string>? Disconnected;
         public event EventHandler<bool>? AuthenticationChanged;
         
+        // Propriedades
+        public bool IsConnected => !_isDisconnected;
+        public bool IsAuthenticated => _isAuthenticated;
+        public bool IsTimedOut => DateTime.Now - _lastActivity > SessionTimeout;
+        public DateTime LastActivity => _lastActivity;
+        public DateTime LastPacketTime => _lastPacketTime;
+        public FastUdpConnection Connection => _connection;
+
         public FastUdpSession(string id, IPEndPoint remoteEndPoint, Socket socket)
         {
             Id = id;
             RemoteEndPoint = remoteEndPoint;
-            LastPacketTime = DateTime.Now;
-            IsConnected = true;
-            IsAuthenticated = false;
-            Connection = new FastUdpConnection(remoteEndPoint);
+            _lastActivity = DateTime.Now;
+            _lastPacketTime = DateTime.Now;
+            _isAuthenticated = false;
+            _isDisconnected = false;
+            _connection = new FastUdpConnection(remoteEndPoint);
             _socket = socket;
+        }
+        
+        // Configurar o thread pool
+        public void SetThreadPool(FastThreadPool threadPool)
+        {
+            _threadPool = threadPool;
         }
         
         public void UpdateActivity()
         {
-            LastPacketTime = DateTime.Now;
+            _lastActivity = DateTime.Now;
+            _lastPacketTime = DateTime.Now;
         }
         
-        public bool Send(byte[] data)
+        // Método para enviar dados usando o thread pool se disponível
+        public void Send(byte[] data)
         {
-            if (!IsConnected)
-            {
-                return false;
-            }
-            
+            if (_isDisconnected)
+                return;
+                
             try
             {
-                _socket.SendTo(data, RemoteEndPoint);
-                MessageSent?.Invoke(this, $"Data sent to {Id} ({data.Length} bytes)");
-                return true;
+                // Atualizar estatísticas de envio
+                _connection.AddSentBytes(data.Length);
+                
+                // Usar thread pool se disponível
+                if (_threadPool != null)
+                {
+                    _threadPool.EnqueuePacketForSending(_socket, RemoteEndPoint, data);
+                }
+                else
+                {
+                    // Fallback para envio síncrono se thread pool não estiver configurado
+                    _socket.SendTo(data, RemoteEndPoint);
+                }
+                
+                UpdateActivity();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error sending data to {Id}: {ex.Message}");
-                return false;
+                Console.WriteLine($"Error sending to session {Id}: {ex.Message}");
+                // Não marcar como desconectado aqui, deixar para o servidor decidir
             }
         }
         
         // Método para enviar pacote formatado
-        public bool SendPacket(FastPacket packet)
+        public void SendPacket(FastPacket packet)
         {
-            return Send(packet.Serialize());
+            if (_isDisconnected)
+                return;
+                
+            byte[] data = packet.Serialize();
+            Send(data);
+            MessageSent?.Invoke(this, $"Packet {packet.Type} sent to {Id} ({data.Length} bytes)");
         }
         
         // Conveniência para enviar mensagem de texto
-        public bool SendMessage(string message)
+        public void SendMessage(string message)
         {
-            try
-            {
-                var packet = new FastPacket(EPacketType.Message, message, Id);
-                return SendPacket(packet);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error creating message packet: {ex.Message}");
-                return false;
-            }
+            if (_isDisconnected)
+                return;
+                
+            var packet = new FastPacket(EPacketType.Message, message);
+            SendPacket(packet);
         }
         
-        // Método para desconectar este cliente
         public void Disconnect(string reason = "Session closed by server")
         {
             if (!IsConnected)
@@ -89,38 +124,32 @@ namespace FastUDP {
                 
             try
             {
-                // Enviar pacote de desconexão
                 var packet = new FastPacket(EPacketType.Disconnect, reason);
                 SendPacket(packet);
                 
-                // Marcar como desconectado
-                IsConnected = false;
+                _isDisconnected = true;
                 
-                // Disparar evento
                 Disconnected?.Invoke(this, reason);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error disconnecting session {Id}: {ex.Message}");
-                // Marcar como desconectado mesmo em caso de erro
-                IsConnected = false;
+                _isDisconnected = true;
             }
         }
         
-        // Método para autenticar a sessão (pode ser usado para sessões que requerem login)
         public void Authenticate()
         {
-            IsAuthenticated = true;
+            _isAuthenticated = true;
             UpdateActivity();
             AuthenticationChanged?.Invoke(this, true);
         }
         
-        // Método para definir o estado de autenticação diretamente
         public void SetAuthenticationState(bool authenticated)
         {
-            if (IsAuthenticated != authenticated)
+            if (_isAuthenticated != authenticated)
             {
-                IsAuthenticated = authenticated;
+                _isAuthenticated = authenticated;
                 UpdateActivity();
                 AuthenticationChanged?.Invoke(this, authenticated);
             }

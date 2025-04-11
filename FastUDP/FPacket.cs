@@ -80,71 +80,54 @@ namespace FastUDP
         // Serializa o pacote em um array de bytes para transmissão
         public byte[] Serialize()
         {
+            byte[] result;
+            
             // Para pacotes simples como Ping e Pong, apenas o tipo é enviado
             if (Type == EPacketType.Ping || Type == EPacketType.Pong)
             {
                 return new byte[] { (byte)Type };
             }
             
-            // CASO ESPECIAL: ConnectResponse PRECISA incluir o SessionId para o cliente estabelecer conexão
+            // CASO ESPECIAL: ConnectResponse PRECISA incluir o SessionId
             if (Type == EPacketType.ConnectResponse)
             {
-                // Converter SessionId em bytes
-                byte[] sessionIdBytes = string.IsNullOrEmpty(SessionId) 
-                    ? new byte[0] 
-                    : Encoding.ASCII.GetBytes(SessionId);
-                
-                // Limitar comprimento do ID de sessão a 255 caracteres
+                byte[] sessionIdBytes = Encoding.ASCII.GetBytes(SessionId ?? "");
                 if (sessionIdBytes.Length > 255)
                 {
+                    // Truncar se for muito grande
                     byte[] truncated = new byte[255];
                     Buffer.BlockCopy(sessionIdBytes, 0, truncated, 0, 255);
                     sessionIdBytes = truncated;
                 }
                 
-                // Calcular tamanho total: tipo + tamanho sessionId + sessionId + dados
-                int totalSize = 1 + 1 + sessionIdBytes.Length + Data.Length;
+                // [Tipo][SessionIdLength][SessionId][Data]
+                result = new byte[1 + 1 + sessionIdBytes.Length + Data.Length];
+                result[0] = (byte)Type;
+                result[1] = (byte)sessionIdBytes.Length;
                 
-                // Criar array para o pacote serializado
-                byte[] packet = new byte[totalSize];
-                
-                // Adicionar o tipo
-                packet[0] = (byte)Type;
-                
-                // Adicionar o tamanho do SessionId
-                packet[1] = (byte)sessionIdBytes.Length;
-                
-                // Adicionar o SessionId
-                Buffer.BlockCopy(sessionIdBytes, 0, packet, 2, sessionIdBytes.Length);
-                
-                // Adicionar os dados após o SessionId
-                if (Data.Length > 0)
+                if (sessionIdBytes.Length > 0)
                 {
-                    Buffer.BlockCopy(Data, 0, packet, 2 + sessionIdBytes.Length, Data.Length);
+                    Buffer.BlockCopy(sessionIdBytes, 0, result, 2, sessionIdBytes.Length);
                 }
                 
-                return packet;
+                if (Data.Length > 0)
+                {
+                    Buffer.BlockCopy(Data, 0, result, 2 + sessionIdBytes.Length, Data.Length);
+                }
             }
-            
-            // PROTOCOLO SIMPLIFICADO para outros tipos de pacotes: Não incluir SessionId
-            // O servidor já conhece o remetente pelo IP/porta
-            
-            // Calcular tamanho total do pacote: tipo + dados
-            int totalSize = 1 + Data.Length;
-            
-            // Criar array para o pacote serializado
-            byte[] packet = new byte[totalSize];
-            
-            // Adicionar o tipo de pacote
-            packet[0] = (byte)Type;
-            
-            // Adicionar dados diretamente após o tipo
-            if (Data.Length > 0)
+            else
             {
-                Buffer.BlockCopy(Data, 0, packet, 1, Data.Length);
+                // FORMATO SIMPLIFICADO: [Tipo][Data]
+                result = new byte[1 + Data.Length];
+                result[0] = (byte)Type;
+                
+                if (Data.Length > 0)
+                {
+                    Buffer.BlockCopy(Data, 0, result, 1, Data.Length);
+                }
             }
             
-            return packet;
+            return result;
         }
         
         // Obter os dados como string UTF-8

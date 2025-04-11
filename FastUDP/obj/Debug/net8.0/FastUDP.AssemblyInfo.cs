@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("FastUDP")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b23ee5d0c8c74e3d481e98d16911f4361d958b30")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d22355e508806d8995551987e3fe069ec1a5433b")]
 [assembly: System.Reflection.AssemblyProductAttribute("FastUDP")]
 [assembly: System.Reflection.AssemblyTitleAttribute("FastUDP")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

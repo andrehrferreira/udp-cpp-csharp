@@ -69,7 +69,7 @@ public:
         m_client->SetConnectedHandler([this](const std::string& sessionId) {
             m_isConnected = true;
             g_connectedClients++;
-            LogMessage("Client " + m_id + " connected with session ID: " + sessionId);
+            //LogMessage("Client " + m_id + " connected with session ID: " + sessionId);
         });
 
         m_client->SetDisconnectedHandler([this](const std::string& reason) {

@@ -561,15 +561,9 @@ void FastUdpClient::HandleConnectResponse(const FastPacket& packet) {
     
     // Important: Reset waiting flag immediately to prevent race conditions
     waitingForConnectResponse = false;
-    
-    LogDebug("Processing ConnectResponse with SessionId: '" + packet.GetSessionId() + "'", LogLevel::Basic);
-        
+      
     // If already connected, and it's the same session, just ignore and don't create a duplicate
     if (connected) {
-        LogDebug("Received ConnectResponse while already connected. Current: " + sessionId + 
-                ", Received: " + packet.GetSessionId(), LogLevel::Basic);
-                
-        // Cancel any reconnection attempts that might have been scheduled
         StopReconnectTimer();
         return;
     }

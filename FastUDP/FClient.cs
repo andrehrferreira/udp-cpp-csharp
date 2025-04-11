@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Timers;
+using System.Threading;
+using System.Collections.Concurrent;
 
 namespace FastUDP {
     public class FastUdpClient : IDisposable
@@ -14,9 +16,19 @@ namespace FastUDP {
         private readonly System.Timers.Timer _reconnectTimer;
         private System.Timers.Timer _connectTimeoutTimer;
         private bool _isReconnecting;
-        private bool _serverShutdown;
         private bool _waitingForConnectResponse;
         private CancellationTokenSource _listenerCts;
+        private Thread _listenerThread; // Thread dedicada para receber mensagens
+        private bool _isListenerRunning;
+        
+        // Client thread pool para processamento de pacotes e envio
+        private const int RECEIVE_THREADS = 3; // 3 threads para processamento
+        private const int SEND_THREADS = 2;    // 2 threads para envio
+        private BlockingCollection<ReceivedPacket> _receiveQueue; // Fila de pacotes recebidos
+        private BlockingCollection<OutgoingPacket> _sendQueue;    // Fila de pacotes para enviar
+        private Thread[] _receiveThreads;  // Pool de threads para processamento
+        private Thread[] _sendThreads;     // Pool de threads para envio
+        private bool _threadPoolRunning;
         
         // List of channels user is part of
         private readonly List<string> _channels = new();
@@ -47,12 +59,40 @@ namespace FastUDP {
             _serverEndPoint = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
             _connected = false;
             _isReconnecting = false;
-            _serverShutdown = false;
             _waitingForConnectResponse = false;
             _listenerCts = new CancellationTokenSource();
             
             // Configurar o socket para não bloquear
             _client.Client.Blocking = false;
+            
+            // Inicializar filas e threads do pool
+            _threadPoolRunning = true;
+            _receiveQueue = new BlockingCollection<ReceivedPacket>(new ConcurrentQueue<ReceivedPacket>(), 1000);
+            _sendQueue = new BlockingCollection<OutgoingPacket>(new ConcurrentQueue<OutgoingPacket>(), 1000);
+            _receiveThreads = new Thread[RECEIVE_THREADS];
+            _sendThreads = new Thread[SEND_THREADS];
+            
+            // Iniciar threads de processamento
+            for (int i = 0; i < RECEIVE_THREADS; i++)
+            {
+                _receiveThreads[i] = new Thread(ProcessPacketWorker)
+                {
+                    Name = $"UDP-Client-Process-{i}",
+                    IsBackground = true
+                };
+                _receiveThreads[i].Start();
+            }
+            
+            // Iniciar threads de envio
+            for (int i = 0; i < SEND_THREADS; i++)
+            {
+                _sendThreads[i] = new Thread(SendPacketWorker)
+                {
+                    Name = $"UDP-Client-Send-{i}",
+                    IsBackground = true
+                };
+                _sendThreads[i].Start();
+            }
             
             // Configurar timer de ping (5 segundos) - NÃO iniciar até ter conexão
             _pingTimer = new System.Timers.Timer(5000);
@@ -69,19 +109,53 @@ namespace FastUDP {
             _connectTimeoutTimer.Elapsed += HandleConnectTimeout;
             _connectTimeoutTimer.AutoReset = false;
             
-            // Iniciar thread de escuta
-            Task.Run(() => ListenForMessagesAsync(_listenerCts.Token));
+            // Iniciar thread de escuta - usar um método de wrapper que não retorna async Task
+            _listenerThread = new Thread(ListenerThreadWrapper)
+            {
+                Name = "UDP-Client-Listener",
+                IsBackground = true
+            };
+            _isListenerRunning = true;
+            _listenerThread.Start();
             
             // Iniciar processo de conexão
             Connect();
         }
         
+        // Método wrapper para executar a tarefa de escuta sem gerar o aviso CS4014
+        private void ListenerThreadWrapper()
+        {
+            // Executa o método assíncrono e aguarda a conclusão de forma segura
+            ListenForMessagesAsync(_listenerCts.Token).ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+        
+        // Estrutura para pacotes recebidos na fila de processamento
+        private struct ReceivedPacket
+        {
+            public byte[] Data { get; }
+            
+            public ReceivedPacket(byte[] data)
+            {
+                Data = data;
+            }
+        }
+        
+        // Estrutura para pacotes na fila de envio
+        private struct OutgoingPacket
+        {
+            public byte[] Data { get; }
+            public IPEndPoint Endpoint { get; }
+            
+            public OutgoingPacket(byte[] data, IPEndPoint endpoint)
+            {
+                Data = data;
+                Endpoint = endpoint;
+            }
+        }
+        
         public void Connect()
         {
             LogDebug("Starting connection to server...", LogLevel.Basic);
-            _serverShutdown = false;
-            _connected = false;
-            _isReconnecting = false;
             
             // Cancel any previous timeout timer
             _connectTimeoutTimer.Stop();
@@ -172,44 +246,64 @@ namespace FastUDP {
         
         private async Task ListenForMessagesAsync(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            LogDebug("Starting dedicated listener thread", LogLevel.Basic);
+            
+            // Buffer para recebimento de dados
+            byte[] buffer = new byte[8192]; // 8KB buffer para mensagens
+            
+            while (!cancellationToken.IsCancellationRequested && _isListenerRunning)
             {
                 try
                 {
-                    // Configurar para receber de forma não bloqueante
+                    // Verificar se há dados disponíveis para leitura
                     if (_client.Available > 0)
                     {
                         IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
                         byte[] data = _client.Receive(ref remoteEP);
-                        ProcessReceivedPacket(data);
+                        
+                        // Fazer uma cópia dos dados e colocar na fila para processamento
+                        byte[] dataCopy = new byte[data.Length];
+                        Buffer.BlockCopy(data, 0, dataCopy, 0, data.Length);
+                        
+                        // Enfileirar para processamento através do thread pool
+                        if (!_receiveQueue.TryAdd(new ReceivedPacket(dataCopy), 1000))
+                        {
+                            LogDebug("Fila de recebimento cheia, pacote descartado", LogLevel.Warning);
+                        }
                     }
                     else
                     {
-                        // Pequena pausa para não sobrecarregar a CPU
-                        await Task.Delay(10, cancellationToken);
+                        // Pausa pequena para não sobrecarregar a CPU
+                        await Task.Delay(1, cancellationToken);
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    // Token de cancelamento foi acionado
+                    // Token de cancelamento foi acionado, sair do loop
                     break;
                 }
                 catch (SocketException ex)
                 {
-                    // Apenas registrar e continuar para erros de socket
+                    // Apenas registrar e continuar para erros de socket não críticos
                     if (ex.SocketErrorCode != SocketError.WouldBlock && 
                         ex.SocketErrorCode != SocketError.TimedOut)
                     {
-                        LogDebug($"Erro de socket: {ex.Message}", LogLevel.Critical);
+                        LogDebug($"Erro de socket na thread de escuta: {ex.Message} (Code: {ex.SocketErrorCode})", LogLevel.Critical);
                     }
-                    await Task.Delay(10, cancellationToken);
+                    
+                    // Pausa maior em caso de erro
+                    await Task.Delay(5, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    LogDebug($"Erro ao receber mensagem: {ex.Message}", LogLevel.Critical);
-                    await Task.Delay(100, cancellationToken);
+                    LogDebug($"Erro na thread de escuta: {ex.Message}", LogLevel.Critical);
+                    
+                    // Pausa maior em caso de erro
+                    await Task.Delay(10, cancellationToken);
                 }
             }
+            
+            LogDebug("Listener thread terminated", LogLevel.Basic);
         }
         
         private void ProcessReceivedPacket(byte[] data)
@@ -317,24 +411,22 @@ namespace FastUDP {
                     case EPacketType.ChannelBroadcast:
                         try
                         {
-                            LogDebug($"Received ChannelBroadcast packet, attempting to parse (SessionId={packet.SessionId})", LogLevel.Basic);
+                            //LogDebug($"Received ChannelBroadcast packet, attempting to parse (SessionId={packet.SessionId})", LogLevel.Basic);
                             
                             // Parse the binary format: channelId length (1 byte) + channelId + message
                             byte[] packetData = packet.Data;
-                            LogDebug($"ChannelBroadcast data length: {packetData.Length} bytes", LogLevel.Basic);
+                            //LogDebug($"ChannelBroadcast data length: {packetData.Length} bytes", LogLevel.Basic);
                             
                             if (packetData.Length < 2) // Need at least 1 byte for length and 1 byte for channel ID
                             {
-                                LogDebug("ChannelBroadcast packet too short, discarding", LogLevel.Critical);
                                 break;
                             }
                                 
                             byte channelIdLength = packetData[0];
-                            LogDebug($"Channel ID length in packet: {channelIdLength}", LogLevel.Basic);
+                            //LogDebug($"Channel ID length in packet: {channelIdLength}", LogLevel.Basic);
                             
                             if (packetData.Length < 1 + channelIdLength) // Ensure we have enough data
                             {
-                                LogDebug("ChannelBroadcast packet missing channel ID data, discarding", LogLevel.Critical);
                                 break;
                             }
                                 
@@ -349,14 +441,14 @@ namespace FastUDP {
                             Buffer.BlockCopy(packetData, 1 + channelIdLength, messageBytes, 0, messageLength);
                             string channelMessage = Encoding.UTF8.GetString(messageBytes);
                             
-                            LogDebug($"Successfully parsed ChannelBroadcast: From={packet.SessionId}, ChannelId={channelId}, MessageLength={messageLength}", LogLevel.Basic);
+                            //LogDebug($"Successfully parsed ChannelBroadcast: From={packet.SessionId}, ChannelId={channelId}, MessageLength={messageLength}", LogLevel.Basic);
                             
                             // Log packet details
-                            LogDebug($"Received ChannelBroadcast packet: From={packet.SessionId}, ChannelId={channelId}, MessageBytes={messageBytes.Length}", LogLevel.Basic);
+                            //LogDebug($"Received ChannelBroadcast packet: From={packet.SessionId}, ChannelId={channelId}, MessageBytes={messageBytes.Length}", LogLevel.Basic);
                             
                             // Notify using the channel message event
                             ChannelMessageReceived?.Invoke(this, $"Channel {channelId} [{packet.SessionId}]: {channelMessage}");
-                            LogDebug($"Received channel message from {channelId} (sender: {packet.SessionId}): {channelMessage}", LogLevel.Basic);
+                            //LogDebug($"Received channel message from {channelId} (sender: {packet.SessionId}): {channelMessage}", LogLevel.Basic);
                         }
                         catch (Exception ex)
                         {
@@ -385,13 +477,9 @@ namespace FastUDP {
             _connectTimeoutTimer.Stop();
             _waitingForConnectResponse = false;
             
-            LogDebug($"Processing ConnectResponse, received SessionId: '{packet.SessionId}'", LogLevel.Basic);
-            
-            // Verificar se o SessionId foi recebido corretamente
+
             if (string.IsNullOrEmpty(packet.SessionId))
             {
-                LogDebug("WARNING: Empty session ID received in ConnectResponse packet!", LogLevel.Warning);
-                // Try to reconnect if the session is invalid
                 StartReconnect();
                 return;
             }
@@ -419,26 +507,43 @@ namespace FastUDP {
         // Method to send data with a specific type
         public void SendPacket(FastPacket packet)
         {
-            // CONNECT is the only packet that can be sent without an established connection
+            // CONNECT é o único pacote que pode ser enviado sem uma conexão estabelecida
             if (packet.Type != EPacketType.Connect && !_connected)
             {
-                LogDebug("Attempted to send while client is disconnected", LogLevel.Warning);
-                throw new InvalidOperationException("Client is not connected. Wait for connection to be established before sending data.");
+                // Silenciosamente descartar pacotes em vez de lançar exceção
+                // quando não estamos conectados (evita inundar o log)
+                if (packet.Type != EPacketType.Ping)
+                {
+                    LogDebug("Dropping packet while disconnected: " + packet.Type, LogLevel.Verbose);
+                }
+                return; // Simplesmente retornar sem lançar exceção
             }
             
             try
             {
                 byte[] packetData = packet.Serialize();
-                _client.Send(packetData, packetData.Length, _serverEndPoint);
+                
+                // Enfileirar para envio através do thread pool
+                if (_threadPoolRunning)
+                {
+                    if (!_sendQueue.TryAdd(new OutgoingPacket(packetData, _serverEndPoint), 1000))
+                    {
+                        LogDebug("Send queue full, packet dropped", LogLevel.Warning);
+                    }
+                }
+                else
+                {
+                    // Fallback para envio direto se o pool não estiver rodando
+                    _client.Send(packetData, packetData.Length, _serverEndPoint);
+                }
             }
             catch (Exception ex)
             {
-                LogDebug($"Error sending packet: {ex.Message}", LogLevel.Critical);
+                LogDebug($"Error preparing packet: {ex.Message}", LogLevel.Critical);
                 if (_connected)
                 {
                     _connected = false;
                     StartReconnect();
-                    throw;
                 }
             }
         }
@@ -448,7 +553,9 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before sending messages.");
+                // Silenciosamente ignorar mensagens quando desconectado
+                LogDebug($"Dropping message while disconnected: {message.Substring(0, Math.Min(message.Length, 20))}...", LogLevel.Verbose);
+                return;
             }
             
             SendPacket(FastPacket.CreateMessage(message, _sessionId));
@@ -459,7 +566,9 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before sending data.");
+                // Silenciosamente ignorar dados quando desconectado
+                LogDebug($"Dropping binary data while disconnected: {data.Length} bytes", LogLevel.Verbose);
+                return;
             }
             
             SendPacket(new FastPacket(EPacketType.BinaryData, data, _sessionId));
@@ -551,7 +660,7 @@ namespace FastUDP {
                 Disconnected?.Invoke(this, "Server offline or unreachable");
                 
                 // Always attempt to reconnect, even if server was shut down
-                _serverShutdown = false;
+                // _serverShutdown = false;
                 
                 // Schedule a new reconnection attempt after 15 seconds
                 _reconnectTimer.Stop();
@@ -578,10 +687,79 @@ namespace FastUDP {
                 }
             }
             
+            // Encerrar todos os timers
             _pingTimer.Stop();
             _reconnectTimer.Stop();
             _connectTimeoutTimer.Stop();
+            
+            // Encerrar thread pools
+            _threadPoolRunning = false;
+            
+            // Sinalizar para completar as filas
+            try
+            {
+                _receiveQueue.CompleteAdding();
+                _sendQueue.CompleteAdding();
+            }
+            catch
+            {
+                // Ignorar erros ao finalizar filas
+            }
+            
+            // Sinalizar para a thread de escuta parar
+            _isListenerRunning = false;
             _listenerCts.Cancel();
+            
+            // Aguardar a thread de escuta terminar (com timeout para evitar bloqueio)
+            try 
+            {
+                if (_listenerThread.IsAlive)
+                {
+                    _listenerThread.Join(1000); // Esperar até 1 segundo
+                }
+            }
+            catch
+            {
+                // Ignorar erros ao encerrar a thread
+            }
+            
+            // Aguardar as threads de processamento terminarem
+            for (int i = 0; i < _receiveThreads.Length; i++)
+            {
+                try
+                {
+                    if (_receiveThreads[i].IsAlive)
+                    {
+                        _receiveThreads[i].Join(500); // Timeout de 500ms por thread
+                    }
+                }
+                catch
+                {
+                    // Ignorar erros ao encerrar as threads
+                }
+            }
+            
+            // Aguardar as threads de envio terminarem
+            for (int i = 0; i < _sendThreads.Length; i++)
+            {
+                try
+                {
+                    if (_sendThreads[i].IsAlive)
+                    {
+                        _sendThreads[i].Join(500); // Timeout de 500ms por thread
+                    }
+                }
+                catch
+                {
+                    // Ignorar erros ao encerrar as threads
+                }
+            }
+            
+            // Dispor recursos
+            _receiveQueue.Dispose();
+            _sendQueue.Dispose();
+            
+            // Fechar o cliente UDP
             _client.Close();
             
             LogDebug("Client disposed", LogLevel.Basic);
@@ -594,7 +772,8 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before joining channels.");
+                LogDebug($"Cannot join channel '{channelId}' while disconnected", LogLevel.Verbose);
+                return;
             }
             
             string message = $"#JOIN:{channelId}";
@@ -607,15 +786,12 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before joining channels.");
+                LogDebug($"Cannot join channel '{channelId}' using binary protocol while disconnected", LogLevel.Verbose);
+                return;
             }
             
-            // Create and send the packet with the binary protocol - using channelId as data
-            // Não incluir SessionId no pacote - o servidor determinará pelo endpoint
             var packet = new FastPacket(EPacketType.ChannelJoin, channelId);
             SendPacket(packet);
-            
-            LogDebug($"Requested to join channel using binary protocol: {channelId}", LogLevel.Basic);
         }
         
         // Leave a channel
@@ -623,14 +799,14 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before leaving channels.");
+                LogDebug($"Cannot leave channel '{channelId}' while disconnected", LogLevel.Verbose);
+                return;
             }
             
             string message = $"#LEAVE:{channelId}";
             SendMessage(message);
             LogDebug($"Requested to leave channel: {channelId}", LogLevel.Basic);
             
-            // Remove from local tracking
             _channels.Remove(channelId);
             ChannelLeft?.Invoke(this, channelId);
         }
@@ -640,7 +816,8 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before creating channels.");
+                LogDebug($"Cannot create channel '{channelName}' while disconnected", LogLevel.Verbose);
+                return;
             }
             
             string type = isPublic ? "public" : "private";
@@ -654,7 +831,8 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before sending channel messages.");
+                LogDebug($"Cannot send message to channel '{channelId}' while disconnected", LogLevel.Verbose);
+                return;
             }
             
             string channelMessage = $"#CHANNEL:{channelId}:{message}";
@@ -667,7 +845,8 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before sending channel messages.");
+                LogDebug($"Cannot send binary message to channel '{channelId}' while disconnected", LogLevel.Verbose);
+                return;
             }
             
             // Debug log
@@ -715,7 +894,6 @@ namespace FastUDP {
             }
             catch (Exception ex) {
                 LogDebug($"Error creating channel broadcast packet: {ex.Message}", LogLevel.Critical);
-                throw;
             }
         }
         
@@ -724,7 +902,8 @@ namespace FastUDP {
         {
             if (!_connected || string.IsNullOrEmpty(_sessionId))
             {
-                throw new InvalidOperationException("Not connected to server. Wait for connection before requesting channel list.");
+                LogDebug("Cannot request channel list while disconnected", LogLevel.Verbose);
+                return;
             }
             
             string message = "#CHANNELS";
@@ -754,6 +933,106 @@ namespace FastUDP {
         public IReadOnlyList<string> GetJoinedChannels()
         {
             return _channels.AsReadOnly();
+        }
+        
+        // Worker thread para processar pacotes recebidos
+        private void ProcessPacketWorker()
+        {
+            LogDebug($"Thread de processamento {Thread.CurrentThread.Name} iniciada", LogLevel.Basic);
+            
+            while (_threadPoolRunning)
+            {
+                try
+                {
+                    // Tentar obter um pacote da fila com timeout para poder verificar _threadPoolRunning
+                    if (_receiveQueue.TryTake(out ReceivedPacket packet, 100))
+                    {
+                        try
+                        {
+                            // Processar o pacote
+                            ProcessReceivedPacket(packet.Data);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"Erro ao processar pacote: {ex.Message}", LogLevel.Critical);
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Ignorar cancelamento normal
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LogDebug($"Erro na thread de processamento: {ex.Message}", LogLevel.Critical);
+                    Thread.Sleep(10); // Pequena pausa em caso de erro
+                }
+            }
+            
+            LogDebug($"Thread de processamento {Thread.CurrentThread.Name} encerrada", LogLevel.Basic);
+        }
+        
+        // Worker thread para enviar pacotes
+        private void SendPacketWorker()
+        {
+            LogDebug($"Thread de envio {Thread.CurrentThread.Name} iniciada", LogLevel.Basic);
+            
+            while (_threadPoolRunning)
+            {
+                try
+                {
+                    // Tentar obter um pacote da fila com timeout para poder verificar _threadPoolRunning
+                    if (_sendQueue.TryTake(out OutgoingPacket packet, 100))
+                    {
+                        try
+                        {
+                            // Verificar novamente a conexão antes de enviar (pode ter mudado desde o enfileiramento)
+                            // Packets do tipo Connect devem ser enviados mesmo sem conexão
+                            if (!_connected && packet.Data.Length > 0 && packet.Data[0] != (byte)EPacketType.Connect)
+                            {
+                                // Silenciosamente descartar pacotes (exceto Connect) quando não estamos conectados
+                                continue;
+                            }
+                            
+                            // Enviar o pacote
+                            _client.Send(packet.Data, packet.Data.Length, packet.Endpoint);
+                        }
+                        catch (SocketException sockEx)
+                        {
+                            // Erros de rede são esperados, apenas log e não marcar como erro crítico
+                            LogDebug($"Network error while sending: {sockEx.Message}", LogLevel.Warning);
+                            
+                            if (_connected && sockEx.SocketErrorCode != SocketError.WouldBlock)
+                            {
+                                _connected = false;
+                                StartReconnect();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"Error sending packet: {ex.Message}", LogLevel.Critical);
+                            if (_connected)
+                            {
+                                _connected = false;
+                                StartReconnect();
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Ignorar cancelamento normal
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LogDebug($"Erro na thread de envio: {ex.Message}", LogLevel.Critical);
+                    Thread.Sleep(10); // Pequena pausa em caso de erro
+                }
+            }
+            
+            LogDebug($"Thread de envio {Thread.CurrentThread.Name} encerrada", LogLevel.Basic);
         }
     }
 }

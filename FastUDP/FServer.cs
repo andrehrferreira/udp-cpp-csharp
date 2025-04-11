@@ -18,9 +18,15 @@ namespace FastUDP {
         
         // Channel manager
         private readonly FastUdpChannelManager _channelManager;
+        
+        // Thread pool for packet processing and sending
+        private readonly FastThreadPool _threadPool;
+        private const int RECEIVE_THREADS = 4;  // Number of threads for packet processing
+        private const int SEND_THREADS = 20;    // Number of threads for packet sending
 
         private bool _running;
         private System.Timers.Timer _sessionMonitor;
+        private System.Timers.Timer _statsTimer;
         
         public bool DebugMode { get; set; } = true;
         
@@ -59,6 +65,14 @@ namespace FastUDP {
             _sessionMonitor = new System.Timers.Timer(5000); // Check every 5 seconds
             _sessionMonitor.Elapsed += CheckSessionsActivity;
             _sessionMonitor.AutoReset = true;
+            
+            // Initialize thread pool with callback to process packets
+            _threadPool = new FastThreadPool(RECEIVE_THREADS, SEND_THREADS, ProcessPacket);
+            
+            // Configure timer to periodically show stats
+            _statsTimer = new System.Timers.Timer(30000); // Every 30 seconds
+            _statsTimer.Elapsed += (s, e) => LogThreadPoolStats();
+            _statsTimer.AutoReset = true;
         }
         
         private void CheckSessionsActivity(object? sender, ElapsedEventArgs e)
@@ -93,11 +107,30 @@ namespace FastUDP {
             }
         }
 
+        // Method for logging thread pool stats
+        private void LogThreadPoolStats()
+        {
+            if (_threadPool != null && _running)
+            {
+                LogServer($"ThreadPool stats - Processed: {_threadPool.TotalPacketsProcessed}, " + 
+                          $"Sent: {_threadPool.TotalPacketsSent}, " + 
+                          $"ReceiveQueue: {_threadPool.ReceiveQueueSize}, " + 
+                          $"SendQueue: {_threadPool.SendQueueSize}, " + 
+                          $"Overflows: {_threadPool.QueueOverflows}",
+                          LogLevel.Basic, ConsoleColor.Cyan);
+            }
+        }
+
         public void Start()
         {
             _running = true;
             _sessionMonitor.Start();
+            _statsTimer.Start();
+            
+            // Start thread pool
+            _threadPool.Start();
 
+            // Start a single thread to receive UDP packets and enqueue them
             Task.Run(() =>
             {
                 while (_running)
@@ -108,16 +141,19 @@ namespace FastUDP {
                         int bytes = _socket.ReceiveFrom(_buffer, 0, _buffer.Length, SocketFlags.None, ref remote);
                         if (bytes > 0)
                         {
+                            // Make a copy of the data and enqueue for processing
                             byte[] packetData = new byte[bytes];
                             Buffer.BlockCopy(_buffer, 0, packetData, 0, bytes);
-                            ProcessPacket((IPEndPoint)remote, packetData);
+                            
+                            // Enqueue packet for processing by the thread pool
+                            _threadPool.EnqueuePacketForProcessing((IPEndPoint)remote, packetData);
                         }
                     }
                     catch (SocketException ex)
                     {
                         if (ex.SocketErrorCode != SocketError.WouldBlock)
                             LogServer($"Socket error: {ex.Message}", LogLevel.Critical, ConsoleColor.Red);
-                        Thread.SpinWait(10); // leve wait
+                        Thread.SpinWait(10); // slight wait
                     }
                 }
             });
@@ -125,6 +161,7 @@ namespace FastUDP {
             LogServer("Fast UDP Server started", LogLevel.Critical, ConsoleColor.Green);
         }
 
+        // Process received packet - used as callback for thread pool
         private void ProcessPacket(IPEndPoint remote, byte[] packetData)
         {
             var endpointKey = remote.ToString();
@@ -139,9 +176,6 @@ namespace FastUDP {
                 {
                     // Associar o SessionId ao pacote, pois ele não vem mais no próprio pacote
                     packet.SessionId = sessionId;
-                    
-                    //LogServer($"Associando sessionId '{sessionId}' ao pacote de tipo {packet.Type} baseado no endpoint {endpointKey}", 
-                    //          LogLevel.Verbose, ConsoleColor.Cyan, sessionId);
                 }               
                 
                 // Process based on packet type
@@ -165,200 +199,11 @@ namespace FastUDP {
                         break;
                         
                     case EPacketType.ChannelJoin:
-                        // Binary protocol for joining a channel - more efficient than text parsing
-                        if (_endpointToSessionId.TryGetValue(endpointKey, out string? joinSessionId) && 
-                            joinSessionId != null && 
-                            _sessions.TryGetValue(joinSessionId, out FastUdpSession? joinSession) && 
-                            joinSession != null)
-                        {
-                            // Extract channel ID from packet data
-                            string channelId = packet.GetDataAsString();
-                            LogServer($"Binary protocol: Session {joinSessionId} requesting to join channel {channelId}", 
-                                     LogLevel.Basic, ConsoleColor.Green, joinSessionId);
-                            
-                            // Get the channel
-                            var channel = _channelManager.GetChannel(channelId);
-                            if (channel != null)
-                            {
-                                // Add the session to the channel
-                                if (channel.Type == EChannelType.Private)
-                                {
-                                    // Private channels need owner permission
-                                    SendErrorPacket(remote, $"Cannot join private channel {channelId}");
-                                    LogServer($"Binary protocol: Session {joinSessionId} cannot join private channel {channelId}", 
-                                             LogLevel.Basic, ConsoleColor.Yellow, joinSessionId);
-                                }
-                                else if (channel.AddSession(joinSession))
-                                {
-                                    // Send confirmation using binary protocol
-                                    var confirmPacket = new FastPacket(EPacketType.ChannelJoinConfirm, 
-                                                                    Encoding.UTF8.GetBytes(channelId), 
-                                                                    joinSessionId);
-                                    byte[] confirmData = confirmPacket.Serialize();
-                                    joinSession.Send(confirmData);
-                                    
-                                    LogServer($"Binary protocol: Session {joinSessionId} joined channel {channel.Name} ({channelId})", 
-                                             LogLevel.Basic, ConsoleColor.Green, joinSessionId);
-                                    
-                                    // Notify channel members
-                                    channel.Broadcast($"[Channel:{channel.Name}] User {joinSessionId} joined the channel", null);
-                                }
-                                else
-                                {
-                                    // Already in channel - still send confirmation
-                                    var confirmPacket = new FastPacket(EPacketType.ChannelJoinConfirm, 
-                                                                    Encoding.UTF8.GetBytes(channelId), 
-                                                                    joinSessionId);
-                                    byte[] confirmData = confirmPacket.Serialize();
-                                    joinSession.Send(confirmData);
-                                    
-                                    LogServer($"Binary protocol: Session {joinSessionId} already in channel {channel.Name} ({channelId})", 
-                                             LogLevel.Basic, ConsoleColor.Yellow, joinSessionId);
-                                }
-                            }
-                            else
-                            {
-                                // Channel not found
-                                SendErrorPacket(remote, $"Channel {channelId} not found");
-                                LogServer($"Binary protocol: Session {joinSessionId} attempted to join non-existent channel {channelId}", 
-                                         LogLevel.Basic, ConsoleColor.Yellow, joinSessionId);
-                            }
-                        }
-                        else
-                        {
-                            // Session not found
-                            SendErrorPacket(remote, "Not connected");
-                            LogServer($"Binary protocol: Unknown client {endpointKey} attempted channel join", 
-                                     LogLevel.Basic, ConsoleColor.Yellow);
-                        }
+                        HandleChannelJoin(remote, endpointKey, packet);
                         break;
                         
                     case EPacketType.ChannelBroadcast:
-                        // Binary protocol for broadcasting to a channel - more efficient than text parsing
-                        LogServer($"Received ChannelBroadcast packet from {endpointKey}, attempting to process", 
-                                 LogLevel.Basic, ConsoleColor.Cyan);
-                                 
-                        if (_endpointToSessionId.TryGetValue(endpointKey, out string? broadcastSessionId) && 
-                            broadcastSessionId != null && 
-                            _sessions.TryGetValue(broadcastSessionId, out FastUdpSession? broadcastSession) && 
-                            broadcastSession != null)
-                        {
-                            try
-                            {
-                                LogServer($"Processing ChannelBroadcast from session {broadcastSessionId}", 
-                                         LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
-                                         
-                                // PROTOCOLO ATUALIZADO: Dados agora estão diretamente após o tipo (sem SessionId)
-                                // Parse the binary format: channelId length (1 byte) + channelId + message
-                                byte[] broadcastData = packet.Data;
-                                LogServer($"ChannelBroadcast packet data length: {broadcastData.Length} bytes", 
-                                         LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
-                                
-                                // Debug - show the raw packet data in hex
-                                StringBuilder hexData = new StringBuilder("Packet Data (hex): ");
-                                for (int i = 0; i < Math.Min(broadcastData.Length, 20); i++) {
-                                    hexData.Append($"{broadcastData[i]:X2} ");
-                                }
-                                LogServer(hexData.ToString(), LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
-                                
-                                if (broadcastData.Length < 2) // Need at least 1 byte for length and 1 byte for channelId
-                                {
-                                    LogServer($"ChannelBroadcast packet too short ({broadcastData.Length} bytes), discarding", 
-                                             LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
-                                    break;
-                                }
-                                    
-                                byte channelIdLength = broadcastData[0];
-                                
-                                // CRITICAL SECURITY FIX: Validate channel ID length more strictly
-                                if (channelIdLength == 0)
-                                {
-                                    LogServer($"Invalid channel ID length: 0 - cannot have empty channel ID", 
-                                             LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
-                                    break;
-                                }
-                                
-                                LogServer($"Channel ID length in packet: {channelIdLength}", 
-                                         LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
-                                                                             
-                                // Extract channel ID
-                                byte[] channelIdBytes = new byte[channelIdLength];
-                                Buffer.BlockCopy(broadcastData, 1, channelIdBytes, 0, channelIdLength);
-                                string broadcastChannelId = Encoding.UTF8.GetString(channelIdBytes);
-                                
-                                // Extract message
-                                int messageLength = broadcastData.Length - 1 - channelIdLength;
-                                byte[] messageBytes = new byte[messageLength];
-                                Buffer.BlockCopy(broadcastData, 1 + channelIdLength, messageBytes, 0, messageLength);
-                                string broadcastMessage = Encoding.UTF8.GetString(messageBytes);
-
-                                Console.WriteLine($"Successfully parsed ChannelBroadcast: ChannelId={broadcastChannelId}, MessageLength={messageLength}");
-                                
-                                LogServer($"Successfully parsed ChannelBroadcast: ChannelId={broadcastChannelId}, MessageLength={messageLength}", 
-                                         LogLevel.Verbose, ConsoleColor.Cyan, broadcastSessionId);
-                                
-                                // Get the channel
-                                var channel = _channelManager.GetChannel(broadcastChannelId);
-                                if (channel != null)
-                                {
-                                    LogServer($"Binary protocol: Session {broadcastSessionId} broadcasting to channel {broadcastChannelId}: {broadcastMessage.Substring(0, Math.Min(20, broadcastMessage.Length))}...", 
-                                             LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
-                                    
-                                    // Check if session is in the channel and allowed to broadcast
-                                    if (channel.HasSession(broadcastSessionId))
-                                    {
-                                        if (channel.IsAllowedToBroadcast(broadcastSession))
-                                        {
-                                            // Format the message for the channel and broadcast it
-                                            string formattedMessage = $"[Channel:{channel.Name}] {broadcastSessionId}: {broadcastMessage}";
-                                            
-                                            if (channel.BroadcastChannelMessage(broadcastChannelId, broadcastMessage, broadcastSession))
-                                            {
-                                                LogServer($"Binary protocol: Successfully broadcast message from {broadcastSessionId} to channel {channel.Name}", 
-                                                         LogLevel.Verbose, ConsoleColor.Cyan, broadcastSessionId);
-                                            }
-                                            else
-                                            {
-                                                LogServer($"Binary protocol: Failed to broadcast message from {broadcastSessionId} to channel {channel.Name}", 
-                                                         LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
-                                                SendErrorPacket(remote, $"Failed to broadcast to channel {channel.Name}");
-                                            }
-                                        }
-                                        else
-                                        {
-                                            LogServer($"Binary protocol: Session {broadcastSessionId} not allowed to broadcast to channel {channel.Name}", 
-                                                     LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
-                                            SendErrorPacket(remote, $"Not allowed to broadcast to channel {channel.Name}");
-                                        }
-                                    }
-                                    else
-                                    {
-                                        LogServer($"Binary protocol: Session {broadcastSessionId} not in channel {channel.Name}", 
-                                                 LogLevel.Basic, ConsoleColor.Yellow, broadcastSessionId);
-                                        SendErrorPacket(remote, $"Not in channel {channel.Name}");
-                                    }
-                                }
-                                else
-                                {
-                                    LogServer($"Binary protocol: Session {broadcastSessionId} attempted to broadcast to non-existent channel {broadcastChannelId}", 
-                                             LogLevel.Basic, ConsoleColor.Yellow, broadcastSessionId);
-                                    SendErrorPacket(remote, $"Channel {broadcastChannelId} not found");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                LogServer($"Binary protocol: Error processing channel broadcast: {ex.Message}", 
-                                         LogLevel.Critical, ConsoleColor.Red, broadcastSessionId);
-                                SendErrorPacket(remote, $"Error processing channel broadcast: {ex.Message}");
-                            }
-                        }
-                        else
-                        {
-                            // Session not found
-                            SendErrorPacket(remote, "Not connected");
-                            LogServer($"Binary protocol: Unknown client {endpointKey} attempted channel broadcast", 
-                                     LogLevel.Basic, ConsoleColor.Yellow);
-                        }
+                        HandleChannelBroadcast(remote, endpointKey, packet);
                         break;
                         
                     default:
@@ -376,6 +221,145 @@ namespace FastUDP {
                 
                 // Send error message to client
                 SendErrorPacket(remote, $"Error processing packet: {ex.Message}");
+            }
+        }
+        
+        // Break out channel join handling to a separate method for clarity
+        private void HandleChannelJoin(IPEndPoint remote, string endpointKey, FastPacket packet)
+        {
+            // Binary protocol for joining a channel - more efficient than text parsing
+            if (_endpointToSessionId.TryGetValue(endpointKey, out string? joinSessionId) && 
+                joinSessionId != null && 
+                _sessions.TryGetValue(joinSessionId, out FastUdpSession? joinSession) && 
+                joinSession != null)
+            {
+                // Extract channel ID from packet data
+                string channelId = packet.GetDataAsString();
+                
+                // Get the channel
+                var channel = _channelManager.GetChannel(channelId);
+                if (channel != null)
+                {
+                    // Add the session to the channel
+                    if (channel.Type == EChannelType.Private)
+                    {
+                        // Private channels need owner permission
+                        SendErrorPacket(remote, $"Cannot join private channel {channelId}");
+                    }
+                    else if (channel.AddSession(joinSession))
+                    {
+                        // Ensure channel has thread pool configured
+                        channel.SetThreadPool(_threadPool, _socket);
+                        
+                        // Send confirmation using binary protocol
+                        var confirmPacket = new FastPacket(EPacketType.ChannelJoinConfirm, 
+                                                        Encoding.UTF8.GetBytes(channelId), 
+                                                        joinSessionId);
+                        byte[] confirmData = confirmPacket.Serialize();
+                        joinSession.Send(confirmData);
+                        
+                        channel.Broadcast($"[Channel:{channel.Name}] User {joinSessionId} joined the channel", null);
+                    }
+                    else
+                    {
+                        // Already in channel - still send confirmation
+                        var confirmPacket = new FastPacket(EPacketType.ChannelJoinConfirm, 
+                                                        Encoding.UTF8.GetBytes(channelId), 
+                                                        joinSessionId);
+                        byte[] confirmData = confirmPacket.Serialize();
+                        joinSession.Send(confirmData);
+                    }
+                }
+                else
+                {
+                    // Channel not found
+                    SendErrorPacket(remote, $"Channel {channelId} not found");
+                }
+            }
+            else
+            {
+                // Session not found
+                SendErrorPacket(remote, "Not connected");
+            }
+        }
+        
+        // Break out channel broadcast handling to a separate method
+        private void HandleChannelBroadcast(IPEndPoint remote, string endpointKey, FastPacket packet)
+        {
+            if (_endpointToSessionId.TryGetValue(endpointKey, out string? broadcastSessionId) && 
+                broadcastSessionId != null && 
+                _sessions.TryGetValue(broadcastSessionId, out FastUdpSession? broadcastSession) && 
+                broadcastSession != null)
+            {
+                try
+                {
+                    byte[] broadcastData = packet.Data;
+                    
+                    if (broadcastData.Length < 2) // Need at least 1 byte for length and 1 byte for channelId
+                    {
+                        return;
+                    }
+                        
+                    byte channelIdLength = broadcastData[0];
+                    
+                    if (channelIdLength == 0)
+                    {
+                        return;
+                    }
+                                                                                 
+                    // Extract channel ID
+                    byte[] channelIdBytes = new byte[channelIdLength];
+                    Buffer.BlockCopy(broadcastData, 1, channelIdBytes, 0, channelIdLength);
+                    string broadcastChannelId = Encoding.UTF8.GetString(channelIdBytes);
+                    
+                    // Extract message
+                    int messageLength = broadcastData.Length - 1 - channelIdLength;
+                    byte[] messageBytes = new byte[messageLength];
+                    Buffer.BlockCopy(broadcastData, 1 + channelIdLength, messageBytes, 0, messageLength);
+                    string broadcastMessage = Encoding.UTF8.GetString(messageBytes);
+
+                    // Get the channel
+                    var channel = _channelManager.GetChannel(broadcastChannelId);
+                    if (channel != null)
+                    {                                    
+                        // Check if session is in the channel and allowed to broadcast
+                        if (channel.HasSession(broadcastSessionId))
+                        {
+                            if (channel.IsAllowedToBroadcast(broadcastSession))
+                            {
+                                // Ensure channel has thread pool configured
+                                channel.SetThreadPool(_threadPool, _socket);
+                                
+                                // Format the message for the channel and broadcast it using optimized method
+                                if (!channel.BroadcastChannelMessage(broadcastChannelId, broadcastMessage, broadcastSession))
+                                {
+                                    SendErrorPacket(remote, $"Failed to broadcast to channel {channel.Name}");
+                                }
+                            }
+                            else
+                            {
+                                SendErrorPacket(remote, $"Not allowed to broadcast to channel {channel.Name}");
+                            }
+                        }
+                        else
+                        {
+                            SendErrorPacket(remote, $"Not in channel {channel.Name}");
+                        }
+                    }
+                    else
+                    {
+                        SendErrorPacket(remote, $"Channel {broadcastChannelId} not found");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SendErrorPacket(remote, $"Error processing channel broadcast: {ex.Message}");
+                }
+            }
+            else
+            {
+                // Session not found
+                SendErrorPacket(remote, "Not connected");
             }
         }
         
@@ -418,6 +402,9 @@ namespace FastUDP {
                 session.SetAuthenticationState(true);
                 isNewSession = true;
                 
+                // Configure thread pool
+                session.SetThreadPool(_threadPool);
+                
                 // Register callbacks for session events
                 session.Disconnected += OnSessionDisconnected;
                 session.MessageSent += OnSessionMessageSent;
@@ -425,14 +412,10 @@ namespace FastUDP {
                 if (_sessions.TryAdd(sessionId, session))
                 {
                     _endpointToSessionId[endpointKey] = sessionId;
-                    LogServer($"New session created: {sessionId} for {endpointKey}", 
-                              LogLevel.Basic, ConsoleColor.Green, sessionId);
                     
-                    // Add new session to the system channel
                     _channelManager.AddSessionToSystemChannel(session);
-                    
-                    // Add session to any public channels
                     _channelManager.AddSessionToPublicChannels(session);
+                    _channelManager.SystemChannel.SetThreadPool(_threadPool, _socket);
                 }
             }
             else if (sessionId != null)
@@ -489,18 +472,6 @@ namespace FastUDP {
             {
                 // Fallback to traditional method if session not available
                 _socket.SendTo(responseData, remote);
-            }
-            
-            // Log only if it's a new session to reduce noise
-            if (isNewSession)
-            {
-                LogServer($"Sending connection response to {endpointKey} with ID: {sessionId}", 
-                        LogLevel.Basic, ConsoleColor.Green, sessionId);
-            }
-            else
-            {
-                LogServer($"Sending connection response to {endpointKey}", 
-                        LogLevel.Verbose, ConsoleColor.Green, sessionId);
             }
         }
         
@@ -624,27 +595,58 @@ namespace FastUDP {
         {
             var errorPacket = new FastPacket(EPacketType.Error, errorMessage);
             byte[] packetData = errorPacket.Serialize();
-            _socket.SendTo(packetData, remote);
+            
+            // Use thread pool if available
+            if (_threadPool != null)
+            {
+                _threadPool.EnqueuePacketForSending(_socket, remote, packetData);
+            }
+            else
+            {
+                // Fallback to direct send
+                _socket.SendTo(packetData, remote);
+            }
         }
         
         private void SendReconnectPacket(IPEndPoint remote)
         {
             var reconnectPacket = FastPacket.CreateReconnect();
             byte[] packetData = reconnectPacket.Serialize();
-            _socket.SendTo(packetData, remote);
+            
+            // Use thread pool if available
+            if (_threadPool != null)
+            {
+                _threadPool.EnqueuePacketForSending(_socket, remote, packetData);
+            }
+            else
+            {
+                // Fallback to direct send
+                _socket.SendTo(packetData, remote);
+            }
         }
         
         private void SendConnectRequiredPacket(IPEndPoint remote)
         {
             var connectPacket = FastPacket.CreateConnect();
             byte[] packetData = connectPacket.Serialize();
-            _socket.SendTo(packetData, remote);
+            
+            // Use thread pool if available
+            if (_threadPool != null)
+            {
+                _threadPool.EnqueuePacketForSending(_socket, remote, packetData);
+            }
+            else
+            {
+                // Fallback to direct send
+                _socket.SendTo(packetData, remote);
+            }
         }
 
         public void Stop()
         {
             _running = false;
             _sessionMonitor.Stop();
+            _statsTimer.Stop();
             
             // Send system broadcast about shutdown
             SystemBroadcast("Server is shutting down");
@@ -668,6 +670,12 @@ namespace FastUDP {
             
             // Small pause to allow messages to be sent
             Thread.Sleep(500);
+            
+            // Stop thread pool
+            _threadPool.Stop();
+            
+            // Display final stats
+            LogThreadPoolStats();
             
             // Clear collections
             _sessions.Clear();

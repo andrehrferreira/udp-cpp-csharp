@@ -23,7 +23,7 @@ namespace UDPBenchmark
         // Send a channel message using binary protocol
         public static void SendChannelMessage(FastUdpClient client, string channelId, string message)
         {
-            Console.WriteLine($"Sending channel message to {channelId}: {message}");
+            //Console.WriteLine($"Sending channel message to {channelId}: {message}");
             // Format: channelId length (1 byte) + channelId + message
             byte[] channelIdBytes = System.Text.Encoding.UTF8.GetBytes(channelId);
             byte[] messageBytes = System.Text.Encoding.UTF8.GetBytes(message);
@@ -34,12 +34,6 @@ namespace UDPBenchmark
             Buffer.BlockCopy(channelIdBytes, 0, data, 1, channelIdBytes.Length);
             Buffer.BlockCopy(messageBytes, 0, data, 1 + channelIdBytes.Length, messageBytes.Length);
             
-            StringBuilder hexData = new StringBuilder("Packet Data (hex): ");
-            for (int i = 0; i < data.Length; i++) {
-                hexData.Append($"{data[i]:X2} ");
-            }
-            Console.WriteLine(hexData.ToString());
-
             var packet = new FastPacket(EPacketType.ChannelBroadcast, data);
             client.SendPacket(packet);
         }
@@ -48,10 +42,12 @@ namespace UDPBenchmark
     class Program
     {
         // Configuration
-        private const int NUM_CLIENTS = 3;
+        private const int NUM_CLIENTS = 100;
         private const string DEFAULT_SERVER_IP = "127.0.0.1";
         private const int DEFAULT_SERVER_PORT = 2593;
-        private const int MAX_WAIT_SECONDS = 60; // Increased timeout for large number of clients
+        private const int TEST_DURATION_SECONDS = 20; // Duração do teste em segundos
+        private const int PARALLEL_SENDERS = 20; // Número de threads paralelas enviando
+        private const int STATS_INTERVAL_MS = 1000; // Intervalo para estatísticas (1 segundo)
         
         // Batch sizes for connection
         private const int CONNECT_BATCH_SIZE = 50;
@@ -63,6 +59,15 @@ namespace UDPBenchmark
         private static object _consoleLock = new object();
         private static ConcurrentDictionary<string, bool> _connectedSessionIds = new ConcurrentDictionary<string, bool>();
         
+        // Metrics for performance benchmarking
+        private static long _totalMessagesSent = 0;
+        private static long _totalMessagesReceived = 0;
+        private static long _lastMessagesSent = 0;
+        private static long _lastMessagesReceived = 0;
+        private static DateTime _testStartTime;
+        private static volatile bool _continueSending = false; // Flag para controlar o envio
+        private static ManualResetEvent _testCompleted = new ManualResetEvent(false);
+        
         // Channel testing
         private static string _channelId = string.Empty;
         private static string _channelName = "BenchmarkTestChannel"; // Changed to avoid conflicts
@@ -70,8 +75,6 @@ namespace UDPBenchmark
         private static string _channelOwnerSessionId = string.Empty;
         private static ConcurrentDictionary<string, ConcurrentDictionary<int, bool>> _messageReceivedByClient = 
             new ConcurrentDictionary<string, ConcurrentDictionary<int, bool>>();
-        private static int _totalMessagesSent = 0;
-        private static int _totalMessagesReceived = 0;
         private static bool _channelCreated = false;
         private static bool _waitingForChannelCreation = false;
         private static ManualResetEvent _channelCreatedEvent = new ManualResetEvent(false);
@@ -123,21 +126,17 @@ namespace UDPBenchmark
                     // Specifically subscribe to the ChannelMessageReceived event
                     client.ChannelMessageReceived += (sender, channelMessage) =>
                     {
-                        //LogMessage($"Client {clientId} CHANNEL MESSAGE: {channelMessage}");
-                        
-                        // Extract message ID to count messages
+                        // Contar todas as mensagens recebidas para o benchmark
                         var match = Regex.Match(channelMessage, @"Test message (\d+)");
-                        if (match.Success && clientId != 0)
+                        if (match.Success && clientId != 0) // Não contar mensagens no cliente que envia
                         {
-                            string messageId = match.Groups[1].Value;
-                            if (int.TryParse(messageId, out int msgNum))
+                            // Incrementar contador global de mensagens recebidas
+                            Interlocked.Increment(ref _totalMessagesReceived);
+                            
+                            // Opcional: registrar qual mensagem foi recebida para análise detalhada
+                            if (int.TryParse(match.Groups[1].Value, out int msgNum))
                             {
-                                // Only count if this client hasn't already received this message
-                                if (_messageReceivedByClient[clientId.ToString()].TryAdd(msgNum, true))
-                                {
-                                    Interlocked.Increment(ref _totalMessagesReceived);
-                                    //LogMessage($"Client {clientId} counted channel message {messageId} (Total: {_totalMessagesReceived})");
-                                }
+                                _messageReceivedByClient[clientId.ToString()].TryAdd(msgNum, true);
                             }
                         }
                     };
@@ -148,7 +147,6 @@ namespace UDPBenchmark
                         if (_connectedSessionIds.TryAdd(sessionId, true))
                         {
                             int count = Interlocked.Increment(ref _connectedClients);
-                            LogMessage($"Client {clientId} connected with session ID: {sessionId}");
                             
                             // Ensure we don't report more than our actual client count
                             if (count <= NUM_CLIENTS)
@@ -308,34 +306,18 @@ namespace UDPBenchmark
                         // Start the channel message sender if we have a channel owner
                         if (_channelOwner != null && !string.IsNullOrEmpty(_channelId))
                         {                            
-                            // Test system channel broadcast first
-                            LogMessage("Testing system broadcast...");
-                            _channelOwner.SendMessage("SYSTEM TEST MESSAGE");
-                            Thread.Sleep(2000);
+                            // Run the performance test
+                            LogMessage("==== STARTING UDP PERFORMANCE TEST ====");
+                            LogMessage($"Duration: {TEST_DURATION_SECONDS} seconds");
+                            LogMessage($"Connected clients: {_connectedClients}");
+                            LogMessage($"Test channel: {_channelId}");
+                            LogMessage("=========================================");
                             
-                            // Start a thread to send messages to the channel
-                            Task.Run(() => SendChannelMessages());
+                            // Run the test sending messages at high speed
+                            SendChannelMessages();
                             
-                            // Run for 30 seconds
-                            LogMessage($"Starting channel messaging test for 30 seconds... Channel ID: {_channelId}");
-                            int testDuration = 30;
-                            
-                            for (int i = 0; i < testDuration; i++)
-                            {
-                                Thread.Sleep(1000);
-                                
-                                // Every 5 seconds, print statistics
-                                if (i > 0 && i % 5 == 0)
-                                {
-                                    PrintChannelStatistics();
-                                }
-                            }
-                            
-                            // Print final statistics
-                            PrintChannelStatistics();
-                            
-                            // Print per-client reception details
-                            PrintClientReceptionDetails();
+                            // Display final statistics
+                            PrintPerformanceStatistics();
                         }
                         else
                         {
@@ -413,43 +395,155 @@ namespace UDPBenchmark
         {
             try
             {
-                // Use Parallel.For with throttling for message sending
-                int maxDegreeOfParallelism = 10; // Limit to 10 concurrent sends
-                var options = new ParallelOptions 
-                { 
-                    MaxDegreeOfParallelism = maxDegreeOfParallelism 
-                };
+                _testStartTime = DateTime.Now;
+                int messageCounter = 0;
+                _continueSending = true;
                 
-                Parallel.For(0, 10, options, i =>
+                LogMessage($"Starting performance test for {TEST_DURATION_SECONDS} seconds...");
+                LogMessage($"Using {PARALLEL_SENDERS} parallel sender threads");
+                
+                // Start timer to end the test after the defined duration
+                Timer timerEndTest = new Timer(_ => 
                 {
-                    try
+                    _continueSending = false;
+                    LogMessage("Ending message sending phase");
+                    
+                    // Wait for in-transit messages to be delivered (2 seconds)
+                    LogMessage("Waiting 2 seconds for in-transit messages to arrive...");
+                    Thread.Sleep(2000);
+                    _testCompleted.Set();
+                }, null, TEST_DURATION_SECONDS * 1000, Timeout.Infinite);
+                
+                // Create multiple threads to send messages simultaneously
+                Task[] tasks = new Task[PARALLEL_SENDERS];
+                for (int t = 0; t < PARALLEL_SENDERS; t++)
+                {
+                    int threadId = t;
+                    tasks[t] = Task.Run(() => 
                     {
-                        int msgNum = i;
-                        string message = $"Test message {msgNum}";
-                        
-                        // Use the efficient binary channel message method
-                        ChannelOperations.SendChannelMessage(_channelOwner, _channelId, message);
-                        
-                        // Track that we sent this message
-                        Interlocked.Increment(ref _totalMessagesSent);
-                        LogMessage($"Channel owner sent message {msgNum} to channel");
-                        
-                        // Delay between messages to prevent overwhelming the network
-                        Thread.Sleep(200);
-                    }
-                    catch (Exception ex)
+                        Random rnd = new Random(threadId); // Different seed for each thread
+                        while (_continueSending)
+                        {
+                            try
+                            {
+                                // Use message ID based on counter with thread ID
+                                int msgId = Interlocked.Increment(ref messageCounter);
+                                string message = $"Test message {msgId}";
+                                
+                                // Send the message to the channel
+                                ChannelOperations.SendChannelMessage(_channelOwner, _channelId, message);
+                                
+                                // Increment sent message counter
+                                Interlocked.Increment(ref _totalMessagesSent);
+                                
+                                // Small delay to prevent system overload
+                                Thread.Sleep(rnd.Next(1, 5));
+                            }
+                            catch (Exception ex)
+                            {
+                                LogMessage($"Error sending from thread {threadId}: {ex.Message}", true);
+                                Thread.Sleep(100); // Longer pause in case of error
+                            }
+                        }
+                    });
+                }
+                
+                // Start thread to display real-time statistics
+                Task statsTask = Task.Run(() => 
+                {
+                    while (_continueSending)
                     {
-                        LogMessage($"Error sending message {i}: {ex.Message}", true);
+                        Thread.Sleep(STATS_INTERVAL_MS);
+                        
+                        // Calculate messages per second (last interval)
+                        long currentSent = _totalMessagesSent;
+                        long currentReceived = _totalMessagesReceived;
+                        
+                        long sentPerSecond = currentSent - _lastMessagesSent;
+                        long receivedPerSecond = currentReceived - _lastMessagesReceived;
+                        
+                        _lastMessagesSent = currentSent;
+                        _lastMessagesReceived = currentReceived;
+                        
+                        // Display real-time statistics
+                        LogMessage($"Messages sent: {currentSent} ({sentPerSecond}/s) | " +
+                                   $"Received: {currentReceived} ({receivedPerSecond}/s) | " +
+                                   $"Rate: {(currentReceived > 0 ? (double)currentReceived / currentSent * 100 : 0):F2}%");
                     }
                 });
                 
-                // Allow time for last messages to be received
-                Thread.Sleep(2000);
+                // Wait for test completion
+                _testCompleted.WaitOne();
+                
+                // Wait for all threads to complete
+                Task.WaitAll(tasks);
+                
+                // Calculate final statistics
+                TimeSpan duration = DateTime.Now - _testStartTime;
+                double messagesPerSecond = _totalMessagesSent / duration.TotalSeconds;
+                double receivedPerSecond = _totalMessagesReceived / duration.TotalSeconds;
+                
+                LogMessage($"Test completed in {duration.TotalSeconds:F1} seconds");
+                LogMessage($"Total messages sent: {_totalMessagesSent}");
+                LogMessage($"Send rate: {messagesPerSecond:F2} messages/second");
+                LogMessage($"Receive rate: {receivedPerSecond:F2} messages/second");
+                
+                // Calculate expected delivery ratio 
+                // For broadcast messages, each sent message can be received by (NUM_CLIENTS - 1) clients
+                double actualMessagesSent = _totalMessagesSent;
+                double maxPossibleReceptions = actualMessagesSent * (NUM_CLIENTS - 1); // Excluding sender
+                double deliveryRatio = (_totalMessagesReceived > 0 && maxPossibleReceptions > 0) 
+                    ? (double)_totalMessagesReceived / maxPossibleReceptions * 100 
+                    : 0;
+                    
+                LogMessage($"Delivery ratio: {deliveryRatio:F2}%");
             }
             catch (Exception ex)
             {
-                LogMessage($"Error sending channel messages: {ex.Message}", true);
+                LogMessage($"Error in performance test: {ex.Message}", true);
             }
+        }
+        
+        static void PrintPerformanceStatistics()
+        {
+            // Calculate total test duration
+            TimeSpan testDuration = DateTime.Now - _testStartTime;
+            
+            LogMessage("\n===== UDP PERFORMANCE REPORT =====");
+            LogMessage($"Total test duration: {testDuration.TotalSeconds:F2} seconds");
+            LogMessage($"Number of clients: {NUM_CLIENTS}");
+            LogMessage($"Server: {DEFAULT_SERVER_IP}:{DEFAULT_SERVER_PORT}");
+            LogMessage($"Parallel sender threads: {PARALLEL_SENDERS}");
+            
+            // Volume metrics
+            LogMessage("\n--- MESSAGE VOLUME ---");
+            LogMessage($"Total messages sent: {_totalMessagesSent:N0}");
+            LogMessage($"Total message receptions: {_totalMessagesReceived:N0}");
+            
+            // Throughput metrics
+            double msgsPerSecond = _totalMessagesSent / testDuration.TotalSeconds;
+            double receptionPerSecond = _totalMessagesReceived / testDuration.TotalSeconds;
+            
+            LogMessage("\n--- THROUGHPUT ---");
+            LogMessage($"Messages sent per second: {msgsPerSecond:N2}");
+            LogMessage($"Receptions per second: {receptionPerSecond:N2}");
+            
+            // Calculate expected vs. actual delivery
+            int nonOwnerClients = NUM_CLIENTS - 1; // Excluding the channel owner
+            long expectedReceptions = _totalMessagesSent * nonOwnerClients;
+            double deliveryRate = (double)_totalMessagesReceived / expectedReceptions * 100;
+            
+            LogMessage("\n--- RELIABILITY ---");
+            LogMessage($"Maximum possible receptions: {expectedReceptions:N0}");
+            LogMessage($"Actual delivery rate: {deliveryRate:F2}%");
+            LogMessage($"Loss rate: {100 - deliveryRate:F2}%");
+            
+            // Per-client efficiency
+            double msgsPerClientPerSecond = receptionPerSecond / nonOwnerClients;
+            
+            LogMessage("\n--- EFFICIENCY ---");
+            LogMessage($"Messages received per client per second: {msgsPerClientPerSecond:F2}");
+            LogMessage("======================================");
         }
         
         static void PrintChannelStatistics()
@@ -465,7 +559,7 @@ namespace UDPBenchmark
             
             // Calculate expected messages (each message should be received by every non-owner client)
             int nonOwnerClients = NUM_CLIENTS - 1; // Exclude the owner
-            int expectedReceptions = _totalMessagesSent * nonOwnerClients;
+            long expectedReceptions = _totalMessagesSent * nonOwnerClients;
             
             if (expectedReceptions > 0)
             {
@@ -501,7 +595,7 @@ namespace UDPBenchmark
                     if (count < _totalMessagesSent)
                     {
                         List<int> missing = new List<int>();
-                        for (int i = 0; i < _totalMessagesSent; i++)
+                        for (int i = 0; i < (int)Math.Min(_totalMessagesSent, int.MaxValue); i++)
                         {
                             if (!receivedMsgs.ContainsKey(i))
                             {
