@@ -563,14 +563,7 @@ void FastUdpClient::HandleConnectResponse(const FastPacket& packet) {
     waitingForConnectResponse = false;
     
     LogDebug("Processing ConnectResponse with SessionId: '" + packet.GetSessionId() + "'", LogLevel::Basic);
-    
-    if (packet.GetSessionId().empty()) {
-        LogDebug("WARNING: Empty session ID received in ConnectResponse packet!", LogLevel::Warning);
-        // Try to reconnect if the session is invalid
-        StartReconnect();
-        return;
-    }
-    
+        
     // If already connected, and it's the same session, just ignore and don't create a duplicate
     if (connected) {
         LogDebug("Received ConnectResponse while already connected. Current: " + sessionId + 
@@ -594,7 +587,7 @@ void FastUdpClient::HandleConnectResponse(const FastPacket& packet) {
     // Start ping timer IMMEDIATELY to prevent server session timeout
     StartPingTimer();
     
-    LogDebug("Connected to server. Session ID: " + sessionId, LogLevel::Basic);
+    //LogDebug("Connected to server. Session ID: " + sessionId, LogLevel::Basic);
     
     // Start with a ping immediately to prevent session expiration
     try {

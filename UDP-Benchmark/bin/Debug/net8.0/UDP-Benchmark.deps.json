@@ -1,0 +1,39 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "UDP-Benchmark/1.0.0": {
+        "dependencies": {
+          "FastUDP": "1.0.0"
+        },
+        "runtime": {
+          "UDP-Benchmark.dll": {}
+        }
+      },
+      "FastUDP/1.0.0": {
+        "runtime": {
+          "FastUDP.dll": {
+            "assemblyVersion": "1.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "UDP-Benchmark/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "FastUDP/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

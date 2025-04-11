@@ -9,3 +9,4 @@
 /mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/refint/FastUDP.dll
 /mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.pdb
 /mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/ref/FastUDP.dll
+/mnt/g/ToS3/2025/FastUDP/obj/Debug/net8.0/FastUDP.sourcelink.json

@@ -294,6 +294,76 @@ namespace FastUDP {
                         LogDebug($"Error received from server: {packet.GetDataAsString()}", LogLevel.Critical);
                         break;
                         
+                    case EPacketType.ChannelJoinConfirm:
+                        try
+                        {
+                            // Extract channel ID from the packet data
+                            string channelId = packet.GetDataAsString();
+                            
+                            // Add to local tracking
+                            if (!_channels.Contains(channelId))
+                            {
+                                _channels.Add(channelId);
+                                ChannelJoined?.Invoke(this, channelId);
+                                LogDebug($"Joined channel: {channelId} (binary protocol)", LogLevel.Basic);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"Error processing channel join confirmation: {ex.Message}", LogLevel.Critical);
+                        }
+                        break;
+                        
+                    case EPacketType.ChannelBroadcast:
+                        try
+                        {
+                            LogDebug($"Received ChannelBroadcast packet, attempting to parse (SessionId={packet.SessionId})", LogLevel.Basic);
+                            
+                            // Parse the binary format: channelId length (1 byte) + channelId + message
+                            byte[] packetData = packet.Data;
+                            LogDebug($"ChannelBroadcast data length: {packetData.Length} bytes", LogLevel.Basic);
+                            
+                            if (packetData.Length < 2) // Need at least 1 byte for length and 1 byte for channel ID
+                            {
+                                LogDebug("ChannelBroadcast packet too short, discarding", LogLevel.Critical);
+                                break;
+                            }
+                                
+                            byte channelIdLength = packetData[0];
+                            LogDebug($"Channel ID length in packet: {channelIdLength}", LogLevel.Basic);
+                            
+                            if (packetData.Length < 1 + channelIdLength) // Ensure we have enough data
+                            {
+                                LogDebug("ChannelBroadcast packet missing channel ID data, discarding", LogLevel.Critical);
+                                break;
+                            }
+                                
+                            // Extract channel ID
+                            byte[] channelIdBytes = new byte[channelIdLength];
+                            Buffer.BlockCopy(packetData, 1, channelIdBytes, 0, channelIdLength);
+                            string channelId = Encoding.UTF8.GetString(channelIdBytes);
+                            
+                            // Extract message
+                            int messageLength = packetData.Length - 1 - channelIdLength;
+                            byte[] messageBytes = new byte[messageLength];
+                            Buffer.BlockCopy(packetData, 1 + channelIdLength, messageBytes, 0, messageLength);
+                            string channelMessage = Encoding.UTF8.GetString(messageBytes);
+                            
+                            LogDebug($"Successfully parsed ChannelBroadcast: From={packet.SessionId}, ChannelId={channelId}, MessageLength={messageLength}", LogLevel.Basic);
+                            
+                            // Log packet details
+                            LogDebug($"Received ChannelBroadcast packet: From={packet.SessionId}, ChannelId={channelId}, MessageBytes={messageBytes.Length}", LogLevel.Basic);
+                            
+                            // Notify using the channel message event
+                            ChannelMessageReceived?.Invoke(this, $"Channel {channelId} [{packet.SessionId}]: {channelMessage}");
+                            LogDebug($"Received channel message from {channelId} (sender: {packet.SessionId}): {channelMessage}", LogLevel.Basic);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"Error processing channel broadcast: {ex.Message}", LogLevel.Critical);
+                        }
+                        break;
+                        
                     default:
                         LogDebug($"Unhandled packet type: {packet.Type}", LogLevel.Verbose);
                         break;
@@ -315,8 +385,9 @@ namespace FastUDP {
             _connectTimeoutTimer.Stop();
             _waitingForConnectResponse = false;
             
-            //LogDebug($"Processing ConnectResponse, received SessionId: '{packet.SessionId}'", LogLevel.Basic);
+            LogDebug($"Processing ConnectResponse, received SessionId: '{packet.SessionId}'", LogLevel.Basic);
             
+            // Verificar se o SessionId foi recebido corretamente
             if (string.IsNullOrEmpty(packet.SessionId))
             {
                 LogDebug("WARNING: Empty session ID received in ConnectResponse packet!", LogLevel.Warning);
@@ -325,6 +396,7 @@ namespace FastUDP {
                 return;
             }
             
+            // Armazenar o SessionId recebido
             _sessionId = packet.SessionId;
             
             if (!_connected)
@@ -339,7 +411,7 @@ namespace FastUDP {
                 // Start ping timer ONLY after establishing connection
                 _pingTimer.Start();
                 
-                LogDebug($"Connected to server. Session ID: {_sessionId}", LogLevel.Basic);
+                //LogDebug($"Connected to server. Session ID: {_sessionId}", LogLevel.Basic);
                 Connected?.Invoke(this, _sessionId);
             }
         }
@@ -530,6 +602,22 @@ namespace FastUDP {
             LogDebug($"Requested to join channel: {channelId}", LogLevel.Basic);
         }
         
+        // Join a channel using binary protocol (more efficient)
+        public void JoinChannelBinary(string channelId)
+        {
+            if (!_connected || string.IsNullOrEmpty(_sessionId))
+            {
+                throw new InvalidOperationException("Not connected to server. Wait for connection before joining channels.");
+            }
+            
+            // Create and send the packet with the binary protocol - using channelId as data
+            // Não incluir SessionId no pacote - o servidor determinará pelo endpoint
+            var packet = new FastPacket(EPacketType.ChannelJoin, channelId);
+            SendPacket(packet);
+            
+            LogDebug($"Requested to join channel using binary protocol: {channelId}", LogLevel.Basic);
+        }
+        
         // Leave a channel
         public void LeaveChannel(string channelId)
         {
@@ -572,6 +660,63 @@ namespace FastUDP {
             string channelMessage = $"#CHANNEL:{channelId}:{message}";
             SendMessage(channelMessage);
             LogDebug($"Sent message to channel {channelId}", LogLevel.Basic);
+        }
+        
+        // Send a message to a specific channel using binary protocol (more efficient)
+        public void SendChannelBroadcastBinary(string channelId, string message)
+        {
+            if (!_connected || string.IsNullOrEmpty(_sessionId))
+            {
+                throw new InvalidOperationException("Not connected to server. Wait for connection before sending channel messages.");
+            }
+            
+            // Debug log
+            LogDebug($"Preparing binary channel broadcast: Channel={channelId}, Message={message}", LogLevel.Basic);
+            
+            try {
+                // FIXED IMPLEMENTATION: Properly format the binary packet
+                
+                // Format: channelId length (1 byte) + channelId + message
+                byte[] channelIdBytes = Encoding.UTF8.GetBytes(channelId);
+                
+                // Safety check - ensure channel ID is not too long
+                if (channelIdBytes.Length > 255)
+                {
+                    throw new ArgumentException("Channel ID is too long (max 255 bytes)");
+                }
+                
+                byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+                
+                // Create properly formatted data: [channelIdLength (1 byte)][channelId (n bytes)][message (remaining bytes)]
+                byte[] packetData = new byte[1 + channelIdBytes.Length + messageBytes.Length];
+                
+                // First byte is the channel ID length
+                packetData[0] = (byte)channelIdBytes.Length;
+                
+                // Debug - verify the length byte is being set correctly
+                LogDebug($"Setting channel ID length byte to: {packetData[0]} for channel ID '{channelId}'", LogLevel.Basic);
+                
+                // Copy channel ID bytes after the length byte
+                Buffer.BlockCopy(channelIdBytes, 0, packetData, 1, channelIdBytes.Length);
+                
+                // Copy message bytes after the channel ID
+                Buffer.BlockCopy(messageBytes, 0, packetData, 1 + channelIdBytes.Length, messageBytes.Length);
+                
+                // Debug - print the packet structure
+                LogDebug($"Binary packet structure: [Length={packetData[0]}][ChannelID='{channelId}' ({channelIdBytes.Length} bytes)][Message='{message}' ({messageBytes.Length} bytes)]", LogLevel.Basic);
+                
+                // Create packet with the binary data - NÃO INCLUI SessionId no pacote
+                var packet = new FastPacket(EPacketType.ChannelBroadcast, packetData);
+                
+                // Send the packet
+                SendPacket(packet);
+                
+                LogDebug($"Successfully sent binary broadcast to channel {channelId}", LogLevel.Basic);
+            }
+            catch (Exception ex) {
+                LogDebug($"Error creating channel broadcast packet: {ex.Message}", LogLevel.Critical);
+                throw;
+            }
         }
         
         // Get list of channels

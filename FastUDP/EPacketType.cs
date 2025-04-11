@@ -11,6 +11,11 @@ namespace FastUDP
         Disconnect = 5,
         Shutdown = 6,
         
+        // Channel-related packets (7-9)
+        ChannelJoin = 7,
+        ChannelJoinConfirm = 8,
+        ChannelBroadcast = 9,
+        
         // Pacotes de dados (10+)
         Message = 10,
         BinaryData = 11,

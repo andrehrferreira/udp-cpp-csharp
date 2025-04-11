@@ -16,3 +16,4 @@
 /mnt/g/ToS3/2025/UDP-Server/obj/Debug/net8.0/UDP-Server.csproj.Up2Date
 /mnt/g/ToS3/2025/UDP-Server/bin/Debug/net8.0/FastUDP.dll
 /mnt/g/ToS3/2025/UDP-Server/bin/Debug/net8.0/FastUDP.pdb
+/mnt/g/ToS3/2025/UDP-Server/obj/Debug/net8.0/UDP-Server.sourcelink.json

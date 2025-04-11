@@ -25,6 +25,7 @@ namespace FastUDP {
         public event EventHandler<FastUdpSession>? SessionAdded;
         public event EventHandler<FastUdpSession>? SessionRemoved;
         public event EventHandler<string>? BroadcastSent;
+        public event EventHandler<string>? ChannelMessageReceived;
         
         // Protected methods to raise events (for derived classes)
         protected virtual void OnSessionAdded(FastUdpSession session)
@@ -178,11 +179,136 @@ namespace FastUDP {
             return false;
         }
         
-        // Check if a session is allowed to broadcast
-        protected virtual bool IsAllowedToBroadcast(FastUdpSession session)
+        // Broadcast a message to all sessions in this channel using the binary ChannelBroadcast protocol
+        public virtual bool BroadcastChannelMessage(string channelId, string message, FastUdpSession? sender = null)
         {
-            // By default, only the owner can broadcast
-            return session.Id == Owner.Id;
+            // Check permissions - only owner or system can broadcast
+            if (sender != null && !IsAllowedToBroadcast(sender))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[CHANNEL BROADCAST] Session {sender.Id} not allowed to broadcast to {Name} ({Id})");
+                Console.ResetColor();
+                return false;
+            }
+            
+            int sentCount = 0;
+            
+            try
+            {
+                // Debug info
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Preparing broadcast from {sender?.Id ?? "system"} to channel {Name} ({Id}): '{message.Substring(0, Math.Min(20, message.Length))}'");
+                Console.ResetColor();
+                
+                // Convert channel ID to bytes with a prefix byte for length
+                byte[] channelIdBytes = System.Text.Encoding.UTF8.GetBytes(channelId);
+                if (channelIdBytes.Length > 255)
+                {
+                    throw new ArgumentException("Channel ID is too long (max 255 bytes)");
+                }
+                
+                // Convert message to bytes
+                byte[] messageBytes = System.Text.Encoding.UTF8.GetBytes(message);
+                
+                // Create the complete data payload: [channelIdLength (1 byte)][channelId (n bytes)][message (remaining bytes)]
+                byte[] packetData = new byte[1 + channelIdBytes.Length + messageBytes.Length];
+                packetData[0] = (byte)channelIdBytes.Length;
+                Buffer.BlockCopy(channelIdBytes, 0, packetData, 1, channelIdBytes.Length);
+                Buffer.BlockCopy(messageBytes, 0, packetData, 1 + channelIdBytes.Length, messageBytes.Length);
+                
+                // Create a proper packet - with the sender's session ID
+                var packet = new FastPacket(EPacketType.ChannelBroadcast, packetData, sender?.Id ?? "system");
+                
+                // Debug packet
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Created packet: Type={packet.Type}, SessionId='{packet.SessionId}', DataLength={packet.Data.Length}");
+                Console.ResetColor();
+                
+                // Send to all sessions in the channel except the sender (to avoid echo)
+                foreach (var session in _sessions.Values)
+                {
+                    if (sender != null && session.Id == sender.Id)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Skipping sender {sender.Id}");
+                        Console.ResetColor();
+                        continue; // Skip the sender
+                    }
+                        
+                    bool success = session.SendPacket(packet);
+                    if (success)
+                    {
+                        sentCount++;
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Sent to session {session.Id}");
+                        Console.ResetColor();
+                    }
+                    else
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"[CHANNEL BROADCAST DEBUG] Failed to send to session {session.Id}");
+                        Console.ResetColor();
+                    }
+                }
+                
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[CHANNEL BROADCAST] Binary broadcast sent to {sentCount} sessions in channel {Name} ({Id})");
+                Console.ResetColor();
+                
+                if (sentCount > 0)
+                {
+                    // Use the protected method to raise the event
+                    OnBroadcastSent($"Binary channel broadcast sent to {sentCount} sessions");
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[CHANNEL BROADCAST] Error creating binary broadcast: {ex.Message}");
+                Console.ResetColor();
+            }
+            
+            return false;
+        }
+        
+        // Check if a session is allowed to broadcast
+        public virtual bool IsAllowedToBroadcast(FastUdpSession session)
+        {
+            // For public channels, any member can broadcast
+            if (Type == EChannelType.Public)
+            {
+                bool isMember = HasSession(session.Id);
+                if (isMember)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} IS a member of public channel {Name} ({Id}) and CAN broadcast");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} is NOT a member of public channel {Name} ({Id}) and CANNOT broadcast");
+                    Console.ResetColor();
+                }
+                return isMember;
+            }
+            
+            // For private channels, only the owner can broadcast
+            bool result = session.Id == Owner.Id;
+            if (result)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} IS the owner of private channel {Name} ({Id}) and CAN broadcast");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[CHANNEL BROADCAST] Session {session.Id} is NOT the owner of private channel {Name} ({Id}). Owner is {Owner.Id}");
+                Console.ResetColor();
+            }
+            return result;
         }
     }
     
@@ -209,10 +335,23 @@ namespace FastUDP {
         }
         
         // For system channels, all authenticated sessions can broadcast
-        protected override bool IsAllowedToBroadcast(FastUdpSession session)
+        public override bool IsAllowedToBroadcast(FastUdpSession session)
         {
             // In system channel, any authenticated session can broadcast
-            return session.IsAuthenticated;
+            bool result = session.IsAuthenticated;
+            if (result)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[SYSTEM CHANNEL] Session {session.Id} IS authenticated and CAN broadcast to system channel");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[SYSTEM CHANNEL] Session {session.Id} is NOT authenticated and CANNOT broadcast to system channel");
+                Console.ResetColor();
+            }
+            return result;
         }
         
         // Override to avoid null reference with Owner

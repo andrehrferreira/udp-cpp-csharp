@@ -133,10 +133,15 @@ namespace FastUDP {
             try
             {
                 var packet = new FastPacket(packetData);
-
-                if (_endpointToSessionId.TryGetValue(endpointKey, out string? sessionId) && sessionId != null){
-                    LogServer($"Packet received from {endpointKey}: Type={packet.Type} SessionId={sessionId}", 
-                              LogLevel.Verbose, ConsoleColor.Cyan, sessionId);
+                
+                // ATRIBUIR SessionId DE ACORDO COM O ENDPOINT
+                if (_endpointToSessionId.TryGetValue(endpointKey, out string? sessionId) && sessionId != null)
+                {
+                    // Associar o SessionId ao pacote, pois ele não vem mais no próprio pacote
+                    packet.SessionId = sessionId;
+                    
+                    //LogServer($"Associando sessionId '{sessionId}' ao pacote de tipo {packet.Type} baseado no endpoint {endpointKey}", 
+                    //          LogLevel.Verbose, ConsoleColor.Cyan, sessionId);
                 }               
                 
                 // Process based on packet type
@@ -157,6 +162,203 @@ namespace FastUDP {
                     case EPacketType.Message:
                     case EPacketType.BinaryData:
                         HandleDataPacket(remote, endpointKey, packet);
+                        break;
+                        
+                    case EPacketType.ChannelJoin:
+                        // Binary protocol for joining a channel - more efficient than text parsing
+                        if (_endpointToSessionId.TryGetValue(endpointKey, out string? joinSessionId) && 
+                            joinSessionId != null && 
+                            _sessions.TryGetValue(joinSessionId, out FastUdpSession? joinSession) && 
+                            joinSession != null)
+                        {
+                            // Extract channel ID from packet data
+                            string channelId = packet.GetDataAsString();
+                            LogServer($"Binary protocol: Session {joinSessionId} requesting to join channel {channelId}", 
+                                     LogLevel.Basic, ConsoleColor.Green, joinSessionId);
+                            
+                            // Get the channel
+                            var channel = _channelManager.GetChannel(channelId);
+                            if (channel != null)
+                            {
+                                // Add the session to the channel
+                                if (channel.Type == EChannelType.Private)
+                                {
+                                    // Private channels need owner permission
+                                    SendErrorPacket(remote, $"Cannot join private channel {channelId}");
+                                    LogServer($"Binary protocol: Session {joinSessionId} cannot join private channel {channelId}", 
+                                             LogLevel.Basic, ConsoleColor.Yellow, joinSessionId);
+                                }
+                                else if (channel.AddSession(joinSession))
+                                {
+                                    // Send confirmation using binary protocol
+                                    var confirmPacket = new FastPacket(EPacketType.ChannelJoinConfirm, 
+                                                                    Encoding.UTF8.GetBytes(channelId), 
+                                                                    joinSessionId);
+                                    byte[] confirmData = confirmPacket.Serialize();
+                                    joinSession.Send(confirmData);
+                                    
+                                    LogServer($"Binary protocol: Session {joinSessionId} joined channel {channel.Name} ({channelId})", 
+                                             LogLevel.Basic, ConsoleColor.Green, joinSessionId);
+                                    
+                                    // Notify channel members
+                                    channel.Broadcast($"[Channel:{channel.Name}] User {joinSessionId} joined the channel", null);
+                                }
+                                else
+                                {
+                                    // Already in channel - still send confirmation
+                                    var confirmPacket = new FastPacket(EPacketType.ChannelJoinConfirm, 
+                                                                    Encoding.UTF8.GetBytes(channelId), 
+                                                                    joinSessionId);
+                                    byte[] confirmData = confirmPacket.Serialize();
+                                    joinSession.Send(confirmData);
+                                    
+                                    LogServer($"Binary protocol: Session {joinSessionId} already in channel {channel.Name} ({channelId})", 
+                                             LogLevel.Basic, ConsoleColor.Yellow, joinSessionId);
+                                }
+                            }
+                            else
+                            {
+                                // Channel not found
+                                SendErrorPacket(remote, $"Channel {channelId} not found");
+                                LogServer($"Binary protocol: Session {joinSessionId} attempted to join non-existent channel {channelId}", 
+                                         LogLevel.Basic, ConsoleColor.Yellow, joinSessionId);
+                            }
+                        }
+                        else
+                        {
+                            // Session not found
+                            SendErrorPacket(remote, "Not connected");
+                            LogServer($"Binary protocol: Unknown client {endpointKey} attempted channel join", 
+                                     LogLevel.Basic, ConsoleColor.Yellow);
+                        }
+                        break;
+                        
+                    case EPacketType.ChannelBroadcast:
+                        // Binary protocol for broadcasting to a channel - more efficient than text parsing
+                        LogServer($"Received ChannelBroadcast packet from {endpointKey}, attempting to process", 
+                                 LogLevel.Basic, ConsoleColor.Cyan);
+                                 
+                        if (_endpointToSessionId.TryGetValue(endpointKey, out string? broadcastSessionId) && 
+                            broadcastSessionId != null && 
+                            _sessions.TryGetValue(broadcastSessionId, out FastUdpSession? broadcastSession) && 
+                            broadcastSession != null)
+                        {
+                            try
+                            {
+                                LogServer($"Processing ChannelBroadcast from session {broadcastSessionId}", 
+                                         LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
+                                         
+                                // PROTOCOLO ATUALIZADO: Dados agora estão diretamente após o tipo (sem SessionId)
+                                // Parse the binary format: channelId length (1 byte) + channelId + message
+                                byte[] broadcastData = packet.Data;
+                                LogServer($"ChannelBroadcast packet data length: {broadcastData.Length} bytes", 
+                                         LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
+                                
+                                // Debug - show the raw packet data in hex
+                                StringBuilder hexData = new StringBuilder("Packet Data (hex): ");
+                                for (int i = 0; i < Math.Min(broadcastData.Length, 20); i++) {
+                                    hexData.Append($"{broadcastData[i]:X2} ");
+                                }
+                                LogServer(hexData.ToString(), LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
+                                
+                                if (broadcastData.Length < 2) // Need at least 1 byte for length and 1 byte for channelId
+                                {
+                                    LogServer($"ChannelBroadcast packet too short ({broadcastData.Length} bytes), discarding", 
+                                             LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
+                                    break;
+                                }
+                                    
+                                byte channelIdLength = broadcastData[0];
+                                
+                                // CRITICAL SECURITY FIX: Validate channel ID length more strictly
+                                if (channelIdLength == 0)
+                                {
+                                    LogServer($"Invalid channel ID length: 0 - cannot have empty channel ID", 
+                                             LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
+                                    break;
+                                }
+                                
+                                LogServer($"Channel ID length in packet: {channelIdLength}", 
+                                         LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
+                                                                             
+                                // Extract channel ID
+                                byte[] channelIdBytes = new byte[channelIdLength];
+                                Buffer.BlockCopy(broadcastData, 1, channelIdBytes, 0, channelIdLength);
+                                string broadcastChannelId = Encoding.UTF8.GetString(channelIdBytes);
+                                
+                                // Extract message
+                                int messageLength = broadcastData.Length - 1 - channelIdLength;
+                                byte[] messageBytes = new byte[messageLength];
+                                Buffer.BlockCopy(broadcastData, 1 + channelIdLength, messageBytes, 0, messageLength);
+                                string broadcastMessage = Encoding.UTF8.GetString(messageBytes);
+
+                                Console.WriteLine($"Successfully parsed ChannelBroadcast: ChannelId={broadcastChannelId}, MessageLength={messageLength}");
+                                
+                                LogServer($"Successfully parsed ChannelBroadcast: ChannelId={broadcastChannelId}, MessageLength={messageLength}", 
+                                         LogLevel.Verbose, ConsoleColor.Cyan, broadcastSessionId);
+                                
+                                // Get the channel
+                                var channel = _channelManager.GetChannel(broadcastChannelId);
+                                if (channel != null)
+                                {
+                                    LogServer($"Binary protocol: Session {broadcastSessionId} broadcasting to channel {broadcastChannelId}: {broadcastMessage.Substring(0, Math.Min(20, broadcastMessage.Length))}...", 
+                                             LogLevel.Basic, ConsoleColor.Cyan, broadcastSessionId);
+                                    
+                                    // Check if session is in the channel and allowed to broadcast
+                                    if (channel.HasSession(broadcastSessionId))
+                                    {
+                                        if (channel.IsAllowedToBroadcast(broadcastSession))
+                                        {
+                                            // Format the message for the channel and broadcast it
+                                            string formattedMessage = $"[Channel:{channel.Name}] {broadcastSessionId}: {broadcastMessage}";
+                                            
+                                            if (channel.BroadcastChannelMessage(broadcastChannelId, broadcastMessage, broadcastSession))
+                                            {
+                                                LogServer($"Binary protocol: Successfully broadcast message from {broadcastSessionId} to channel {channel.Name}", 
+                                                         LogLevel.Verbose, ConsoleColor.Cyan, broadcastSessionId);
+                                            }
+                                            else
+                                            {
+                                                LogServer($"Binary protocol: Failed to broadcast message from {broadcastSessionId} to channel {channel.Name}", 
+                                                         LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
+                                                SendErrorPacket(remote, $"Failed to broadcast to channel {channel.Name}");
+                                            }
+                                        }
+                                        else
+                                        {
+                                            LogServer($"Binary protocol: Session {broadcastSessionId} not allowed to broadcast to channel {channel.Name}", 
+                                                     LogLevel.Warning, ConsoleColor.Red, broadcastSessionId);
+                                            SendErrorPacket(remote, $"Not allowed to broadcast to channel {channel.Name}");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        LogServer($"Binary protocol: Session {broadcastSessionId} not in channel {channel.Name}", 
+                                                 LogLevel.Basic, ConsoleColor.Yellow, broadcastSessionId);
+                                        SendErrorPacket(remote, $"Not in channel {channel.Name}");
+                                    }
+                                }
+                                else
+                                {
+                                    LogServer($"Binary protocol: Session {broadcastSessionId} attempted to broadcast to non-existent channel {broadcastChannelId}", 
+                                             LogLevel.Basic, ConsoleColor.Yellow, broadcastSessionId);
+                                    SendErrorPacket(remote, $"Channel {broadcastChannelId} not found");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogServer($"Binary protocol: Error processing channel broadcast: {ex.Message}", 
+                                         LogLevel.Critical, ConsoleColor.Red, broadcastSessionId);
+                                SendErrorPacket(remote, $"Error processing channel broadcast: {ex.Message}");
+                            }
+                        }
+                        else
+                        {
+                            // Session not found
+                            SendErrorPacket(remote, "Not connected");
+                            LogServer($"Binary protocol: Unknown client {endpointKey} attempted channel broadcast", 
+                                     LogLevel.Basic, ConsoleColor.Yellow);
+                        }
                         break;
                         
                     default:
@@ -341,7 +543,7 @@ namespace FastUDP {
         {
             if (sender is FastUdpSession session)
             {
-                LogServer($"Message sent to session {session.Id}: {message}", LogLevel.Verbose, ConsoleColor.Cyan, session.Id);
+                //LogServer($"Message sent to session {session.Id}: {message}", LogLevel.Verbose, ConsoleColor.Cyan, session.Id);
             }
         }
         
@@ -382,13 +584,15 @@ namespace FastUDP {
                         // Check if it's a channel command (starts with #)
                         if (message.StartsWith("#"))
                         {
+                            //LogServer($"CHANNEL COMMAND from {existingSessionId}: {message}", 
+                            //      LogLevel.Basic, ConsoleColor.Magenta, existingSessionId);
                             ProcessChannelCommand(existingSession, message);
                             return; // Don't echo channel commands
                         }
                         
                         // Regular message - log it
-                        LogServer($"Message from {existingSessionId} ({endpointKey}): {message}", 
-                                  LogLevel.Verbose, ConsoleColor.Cyan, existingSessionId);
+                        //LogServer($"Message from {existingSessionId} ({endpointKey}): {message}", 
+                        //          LogLevel.Verbose, ConsoleColor.Cyan, existingSessionId);
                     }
                     else
                     {
@@ -627,6 +831,9 @@ namespace FastUDP {
                 // Get the command type (first part, removing the # prefix)
                 string commandType = parts[0].TrimStart('#');
                 
+                //LogServer($"Processing channel command: {commandType} from session {session.Id}", 
+                //         LogLevel.Basic, ConsoleColor.Magenta, session.Id);
+                
                 switch (commandType.ToUpper())
                 {
                     case "JOIN":
@@ -634,6 +841,8 @@ namespace FastUDP {
                         if (parts.Length >= 2)
                         {
                             string channelId = parts[1];
+                            //LogServer($"JOIN command for channel {channelId} from session {session.Id}", 
+                            //         LogLevel.Basic, ConsoleColor.Green, session.Id);
                             HandleJoinChannelCommand(session, channelId);
                         }
                         break;
@@ -653,6 +862,8 @@ namespace FastUDP {
                         {
                             string channelName = parts[1];
                             bool isPublic = parts[2].ToLower() == "public";
+                            LogServer($"CREATE command for channel '{channelName}' (public: {isPublic}) from session {session.Id}", 
+                                     LogLevel.Basic, ConsoleColor.Green, session.Id);
                             HandleCreateChannelCommand(session, channelName, isPublic);
                         }
                         break;
@@ -663,6 +874,8 @@ namespace FastUDP {
                         {
                             string channelId = parts[1];
                             string message = string.Join(":", parts.Skip(2));
+                            LogServer($"CHANNEL message command for channel {channelId} from session {session.Id}: {message}", 
+                                     LogLevel.Basic, ConsoleColor.Cyan, session.Id);
                             HandleChannelMessageCommand(session, channelId, message);
                         }
                         break;
@@ -690,24 +903,31 @@ namespace FastUDP {
             var channel = _channelManager.GetChannel(channelId);
             if (channel != null)
             {
+                //LogServer($"Join request for channel {channelId} ({channel.Name}) by session {session.Id}", 
+                //         LogLevel.Basic, ConsoleColor.Green, session.Id);
+                
                 // Check if it's a private channel
                 if (channel.Type == EChannelType.Private)
                 {
                     // For private channels, only the owner can add users
                     // We'll respond with an error
                     session.SendMessage($"Error: Cannot join private channel {channelId}. Must be invited by channel owner.");
-                    LogServer($"Session {session.Id} attempted to join private channel {channelId}", 
-                              LogLevel.Basic, ConsoleColor.Yellow, session.Id);
+                    //LogServer($"Session {session.Id} attempted to join private channel {channelId}", 
+                    //          LogLevel.Basic, ConsoleColor.Yellow, session.Id);
                     return;
                 }
                 
                 // Add the session to the channel
                 if (channel.AddSession(session))
                 {
+                    // List all members in the channel for debug
+                    var members = channel.GetSessions().Select(s => s.Id).ToList();
+                    /*LogServer($"Session {session.Id} successfully joined channel {channel.Name} ({channelId}). " +
+                             $"Channel now has {members.Count} members: {string.Join(", ", members)}", 
+                             LogLevel.Basic, ConsoleColor.Green, session.Id);*/
+                    
                     // Notify the session
                     session.SendMessage($"Joined channel: {channel.Name} ({channelId})");
-                    LogServer($"Session {session.Id} joined channel {channel.Name} ({channelId})", 
-                              LogLevel.Basic, ConsoleColor.Green, session.Id);
                     
                     // Notify other channel members
                     channel.Broadcast($"[Channel:{channel.Name}] User {session.Id} joined the channel", null);
@@ -716,14 +936,16 @@ namespace FastUDP {
                 {
                     // Session might already be in the channel
                     session.SendMessage($"Already in channel: {channel.Name} ({channelId})");
+                    //LogServer($"Session {session.Id} was already in channel {channel.Name} ({channelId})", 
+                    //         LogLevel.Basic, ConsoleColor.Yellow, session.Id);
                 }
             }
             else
             {
                 // Channel not found
                 session.SendMessage($"Error: Channel {channelId} not found");
-                LogServer($"Session {session.Id} attempted to join non-existent channel {channelId}", 
-                          LogLevel.Basic, ConsoleColor.Yellow, session.Id);
+                //LogServer($"Session {session.Id} attempted to join non-existent channel {channelId}", 
+                //          LogLevel.Basic, ConsoleColor.Yellow, session.Id);
             }
         }
         
@@ -798,16 +1020,18 @@ namespace FastUDP {
                 var type = isPublic ? EChannelType.Public : EChannelType.Private;
                 var channel = _channelManager.CreateChannel(session, channelName, type);
                 
+                LogServer($"Created {(isPublic ? "public" : "private")} channel: {channelName} " +
+                         $"(ID: {channel.Id}) with owner {session.Id}", 
+                         LogLevel.Critical, ConsoleColor.Green, session.Id);
+                
                 // Notify the session
                 session.SendMessage($"Created {(isPublic ? "public" : "private")} channel: {channelName} (ID: {channel.Id})");
-                LogServer($"Session {session.Id} created {(isPublic ? "public" : "private")} channel {channelName} ({channel.Id})", 
-                          LogLevel.Basic, ConsoleColor.Green, session.Id);
                 
                 // For public channels, broadcast to system channel that a new channel is available
-                if (isPublic)
+                /*if (isPublic)
                 {
                     _channelManager.SystemBroadcast($"New public channel created: {channelName} (ID: {channel.Id})");
-                }
+                }*/
             }
             catch (Exception ex)
             {
@@ -822,18 +1046,48 @@ namespace FastUDP {
             var channel = _channelManager.GetChannel(channelId);
             if (channel != null)
             {
+                LogServer($"Channel message request from {session.Id} to channel {channelId} ({channel.Name}): {message}", 
+                         LogLevel.Basic, ConsoleColor.Cyan, session.Id);
+                
                 // Check if session is in the channel
                 if (channel.HasSession(session.Id))
                 {
-                    // Broadcast the message to the channel
-                    string formattedMessage = $"[Channel:{channel.Name}] {session.Id}: {message}";
-                    if (channel.Broadcast(formattedMessage, session))
+                    // Check if this session is allowed to broadcast
+                    bool canBroadcast = channel.IsAllowedToBroadcast(session);
+                    LogServer($"Session {session.Id} allowed to broadcast to channel {channel.Name} ({channelId}): {canBroadcast}", 
+                             LogLevel.Basic, ConsoleColor.Magenta, session.Id);
+                    
+                    if (canBroadcast)
                     {
-                        LogServer($"Session {session.Id} sent message to channel {channel.Name} ({channelId}): {message}", 
-                                  LogLevel.Verbose, ConsoleColor.Cyan, session.Id);
+                        // Broadcast the message to the channel
+                        string formattedMessage = $"[Channel:{channel.Name}] {session.Id}: {message}";
+                        
+                        // Get list of recipients for logging
+                        var recipients = channel.GetSessions()
+                            .Where(s => s.Id != session.Id) // Exclude sender
+                            .Select(s => s.Id)
+                            .ToList();
+                        
+                        //LogServer($"Broadcasting message to {recipients.Count} members of channel {channel.Name} ({channelId}): " +
+                        //         $"{(recipients.Count > 0 ? string.Join(", ", recipients) : "none")}", 
+                        //         LogLevel.Basic, ConsoleColor.Green, session.Id);
+                        
+                        if (channel.Broadcast(formattedMessage, session))
+                        {
+                            LogServer($"Successfully broadcast message from {session.Id} to channel {channel.Name} ({channelId})", 
+                                     LogLevel.Verbose, ConsoleColor.Cyan, session.Id);
+                        }
+                        else
+                        {
+                            LogServer($"Failed to broadcast message from {session.Id} to channel {channel.Name} ({channelId})", 
+                                     LogLevel.Warning, ConsoleColor.Red, session.Id);
+                            session.SendMessage($"Error: Failed to broadcast to channel {channel.Name} ({channelId})");
+                        }
                     }
                     else
                     {
+                        LogServer($"Session {session.Id} NOT allowed to broadcast to channel {channel.Name} ({channelId})", 
+                                 LogLevel.Warning, ConsoleColor.Red, session.Id);
                         session.SendMessage($"Error: Not allowed to broadcast to channel {channel.Name} ({channelId})");
                     }
                 }
@@ -841,12 +1095,16 @@ namespace FastUDP {
                 {
                     // Not in channel
                     session.SendMessage($"Error: Not in channel {channel.Name} ({channelId})");
+                    LogServer($"Session {session.Id} attempted to broadcast to channel {channel.Name} ({channelId}) but is not a member", 
+                             LogLevel.Basic, ConsoleColor.Yellow, session.Id);
                 }
             }
             else
             {
                 // Channel not found
                 session.SendMessage($"Error: Channel {channelId} not found");
+                LogServer($"Session {session.Id} attempted to broadcast to non-existent channel {channelId}", 
+                         LogLevel.Basic, ConsoleColor.Yellow, session.Id);
             }
         }
         
